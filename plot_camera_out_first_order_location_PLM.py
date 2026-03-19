@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from time import perf_counter, sleep
 from tqdm import tqdm
-from holo_utils import generate_checkerboard, generate_line_pattern, plot_phase_map
+from utils.holo_utils import generate_checkerboard, generate_line_pattern, plot_phase_map
 
 
 def main() -> None:

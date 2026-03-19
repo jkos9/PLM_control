@@ -8,3 +8,5 @@ dist
 **/__pycache__/**
 .DS_Store
 ~$*.xlsx
+pics/
+phase_patterns/
