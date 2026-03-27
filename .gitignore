@@ -10,3 +10,4 @@ dist
 ~$*.xlsx
 pics/
 phase_patterns/
+logs/

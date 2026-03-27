@@ -9,6 +9,7 @@ from glob import glob
 import pathlib
 import logging
 import param
+from PIL import Image as PILImage
 
 try:
     import pygame as pg
@@ -174,6 +175,23 @@ class ImageWindow(Window):
     def __init__(self, **params):
         self._imgs = []
         super().__init__(**params)
+
+    @staticmethod
+    def _pad_pil_image_if_needed(img: Image) -> Image:
+        if img.size == (2712, 1600):
+            padded = PILImage.new(img.mode, (2716, 1600), 0)
+            padded.paste(img, (2, 0))
+            return padded
+        return img
+
+    @staticmethod
+    def _pad_surface_if_needed(img: pg.Surface) -> pg.Surface:
+        if img.get_size() == (2712, 1600):
+            padded = pg.Surface((2716, 1600))
+            padded.fill((0, 0, 0))
+            padded.blit(img, (2, 0))
+            return padded
+        return img
     
     def load(self, img: str | pathlib.Path | Image | pg.Surface, recursive: bool = False):
         """Load an image or series of images for displaying in this window. Image are appended to the 
@@ -198,9 +216,10 @@ class ImageWindow(Window):
         elif isinstance(img, Image):
             if img.mode != 'RGB':
                 img = img.convert('RGB')
+            img = self._pad_pil_image_if_needed(img)
             self._imgs.append(pg.image.frombytes(img.tobytes(), img.size, img.mode))
         elif isinstance(img, pg.Surface):
-            self._imgs.append(img)
+            self._imgs.append(self._pad_surface_if_needed(img))
         else:
             raise TIPLMDisplayException('Error loading image. Type must be str, pathlib.Path, PIL.Image.Image, or pg.Surface.')
         
@@ -231,6 +250,9 @@ class ImageWindow(Window):
         
             if isinstance(img, (str, pathlib.Path)):
                 img = pg.image.load(img)
+
+            if isinstance(img, pg.Surface):
+                img = self._pad_surface_if_needed(img)
         
             tex = Texture.from_surface(self._renderer, img)
             self._renderer.blit(tex, tex.get_rect())
