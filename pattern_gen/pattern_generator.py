@@ -32,8 +32,10 @@ for i, phase_val in enumerate(phase_values):
     #phase = generate_global_pattern(x_dim, y_dim, max_phase=phase_val)
     final_phase_array[i] = phase
 
-np.save(f"phase_patterns/line_phase_sweep_max_20_line_spacing.npy", final_phase_array)
+#np.save(f"phase_patterns/line_phase_sweep_max_20_line_spacing.npy", final_phase_array)
 #np.save(f"phase_patterns/line_phase_sweep_thicker.npy", final_phase_array)
+np.save(f"phase_patterns/global_phase_sweep.npy", final_phase_array)
+
 
 print(final_phase_array.shape)
 

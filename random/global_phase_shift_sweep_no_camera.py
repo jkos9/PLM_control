@@ -123,6 +123,17 @@ def main() -> None:
     # Optional sanity check: each representative maps to unique state 0..N-1
     states = plm.quantize(phase_values[:, None, None]).reshape(-1)
     print("quantized states from representative phases:", states)
+    
+    print(phase_values)
+    #sys.exit()
+
+    x_vals = np.linspace(0, 2*np.pi, len(phase_values))   
+    plt.figure()
+    plt.plot(x_vals, phase_levels, label="Calibrated Phase Levels")
+    plt.plot(x_vals, np.linspace(0, 2*np.pi, len(phase_values)), label="Ideal Linear Phase")
+    #plt.show()
+    #sys.exit()
+
 
     #phase_values = buckets
 
@@ -133,7 +144,9 @@ def main() -> None:
     subplot_rows = 4
     subplot_cols = int(np.ceil(n_phase / subplot_rows))
 
-    plt.figure(figsize=(2.0 * subplot_cols, 1 * subplot_rows))
+
+
+    #plt.figure(figsize=(2.0 * subplot_cols, 1 * subplot_rows))
 
     for i, phase_val in tqdm(enumerate(phase_values), total=len(phase_values)):
 
@@ -151,12 +164,12 @@ def main() -> None:
         print(bmp.shape, phase.shape)
         a = 1
         #plt.figure(figsize=(8, 6))
-        plt.subplot(subplot_rows, subplot_cols, i + 1)
-        plt.imshow(bmp[a:a+2, 0:3], cmap="gray", vmin=0, vmax=1, interpolation="nearest")
-        plt.title(f"Phase: {phase_val:.6f} rad")
+        #plt.subplot(subplot_rows, subplot_cols, i + 1)
+        #plt.imshow(bmp[a:a+2, 0:3], cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+        #plt.title(f"Phase: {phase_val:.6f} rad")
         #plt.show()
-
-        '''
+        #plt.close()
+        #'''
         unique_tiles, tile_counts, this_tile_shape = extract_unique_electrode_patterns(bmp, phase.shape)
         tile_shape = this_tile_shape
         for tile in unique_tiles:
@@ -171,7 +184,7 @@ def main() -> None:
 
 
         #print(bmp_img)
-        sys.exit()
+        #sys.exit()
 
         on_mask = phase > 0
         off_mask = ~on_mask
@@ -207,12 +220,13 @@ def main() -> None:
 
             win.loop_callback = stop_after_duration
             win.run()
+            
 
             bmp_max_list.append(bmp_max)
-        '''
+        #'''
 
-    plt.show()
-
+    #plt.show()
+    sys.exit()
 
     if tile_shape is not None:
         pattern_tiles = list(unique_pattern_dict.values())

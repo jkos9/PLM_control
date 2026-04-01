@@ -42,4 +42,56 @@ def plot_phase_map(phase: np.ndarray) -> None:
     #plt.show()
 
 
+def generate_square_test_patterns(x_dim: int, y_dim: int) -> list[np.ndarray]:
+    """Generate an array of test patterns with different squares in the centre."""
     
+    patterns = []
+    for i in range(1, 5):
+        base_pattern = np.zeros((y_dim, x_dim), dtype=float)
+        
+        # The size of the square increases quadratically with i
+        sq_size = i**2 
+        
+        # Calculate the starting and ending indices for the centered square.
+        # Boundary checks prevent indexing errors if sq_size > array dimensions.
+        start_y = max(0, (y_dim - sq_size) // 2)
+        end_y = min(y_dim, start_y + sq_size)
+        
+        start_x = max(0, (x_dim - sq_size) // 2)
+        end_x = min(x_dim, start_x + sq_size)
+        
+        # Set the center region to Pi
+        base_pattern[start_y:end_y, start_x:end_x] = np.pi
+        
+        patterns.append(base_pattern)
+
+    return patterns
+
+
+def generate_square_test_patterns(x_dim: int, y_dim: int) -> list[np.ndarray]:
+    """Generate an array of test patterns with different squares in the centre."""
+    
+    patterns = []
+    for i in range(1, 5):
+        base_pattern = np.zeros((y_dim, x_dim), dtype=float)
+        
+        # The size of the square increases quadratically with i
+        sq_size = i**2 
+        
+        # Calculate the starting and ending indices for the centered square.
+        # Boundary checks prevent indexing errors if sq_size > array dimensions.
+        start_y = max(0, (y_dim - sq_size) // 2)
+        end_y = min(y_dim, start_y + sq_size)
+        
+        start_x = max(0, (x_dim - sq_size) // 2)
+        end_x = min(x_dim, start_x + sq_size)
+        
+        # Set the center region to Pi
+        base_pattern[start_y:end_y, start_x:end_x] = np.pi
+        
+        patterns.append(base_pattern)
+
+    return patterns
+
+
+
