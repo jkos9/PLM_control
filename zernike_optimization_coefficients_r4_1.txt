@@ -1,0 +1,26 @@
+timestamp_iso=2026-04-02T16:58:43.101318
+best_xt_db=-10.863074
+max_radial_degree=4
+enabled_terms_count=15
+
+Z(0,0)=-0.968186 # Piston
+Z(1,-1)=-1.736510 # Tilt Y
+Z(1,1)=+0.919337 # Tilt X
+Z(2,-2)=+0.079386 # Astigmatism 45°
+Z(2,0)=-4.346175 # Defocus
+Z(2,2)=-0.671739 # Astigmatism 0°
+Z(3,-3)=+0.746106 # Trefoil Y
+Z(3,-1)=+0.126146 # Coma Y
+Z(3,1)=+1.747441 # Coma X
+Z(3,3)=-2.342767 # Trefoil X
+Z(4,-4)=+1.294601 # Quadrafoil 45°
+Z(4,-2)=+0.214497 # Secondary Astigmatism 45°
+Z(4,0)=-0.290306 # Primary Spherical
+Z(4,2)=+0.763637 # Secondary Astigmatism 0°
+Z(4,4)=-0.908016 # Quadrafoil 0°
+Z(5,-5)=+0.000000 # Pentafoil Y
+Z(5,-3)=+0.000000 # Secondary Trefoil Y
+Z(5,-1)=+0.000000 # Secondary Coma Y
+Z(5,1)=+0.000000 # Secondary Coma X
+Z(5,3)=+0.000000 # Secondary Trefoil X
+Z(5,5)=+0.000000 # Pentafoil X

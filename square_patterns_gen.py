@@ -18,6 +18,8 @@ y_dim = 800
 
 plm = PLM.from_db('p67nirtemp')
 phase_levels, buckets, phase_values = get_phase_values_from_calibration(plm)
+print("Phase values from calibration:", phase_values)
+sys.exit()
 
 
 line_spacing = 20 #80 * 3
