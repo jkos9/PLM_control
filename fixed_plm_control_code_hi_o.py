@@ -8,11 +8,13 @@ from pathlib import Path
 from datetime import datetime
 from time import perf_counter
 from typing import Optional
+from matplotlib import image
 import numpy as np
 import matplotlib as mpl
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from PIL import Image
+#from pygame import image
 from vmbpy import PixelFormat, VmbSystem
 
 from utils.math_utils import *
@@ -84,7 +86,10 @@ from ti_plm.display import EventLoopExit, ImageWindow
 
 class FrameProcessorThread(QtCore.QThread):
     # Payload: frame_count, image, fft_image, recovered_field, phase_rgb, roi_sum, roi_mean
-    frame_processed = QtCore.pyqtSignal(int, np.ndarray, np.ndarray, object, object, object, object)
+    #frame_processed = QtCore.pyqtSignal(int, np.ndarray, np.ndarray, object, object, object, object)
+    #error_occurred = QtCore.pyqtSignal(str)
+
+    frame_processed = QtCore.pyqtSignal(dict)
     error_occurred = QtCore.pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -101,7 +106,14 @@ class FrameProcessorThread(QtCore.QThread):
         self.basic_recovery_mode = True
         self.colormap_name = "viridis"
 
-    def update_state(self, frame, count, dark_frame, fft_roi, live_roi, basic_recovery, colormap_name):
+        self.pattern_seq = -1
+        self.pattern_idx = -1
+        self.device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu")
+
+        self._dark_frame_gpu = None
+        self._last_dark_frame_ref = None
+
+    def update_state(self, frame, count, dark_frame, fft_roi, live_roi, basic_recovery, colormap_name, pattern_seq, pattern_idx):
         """Called by the main thread to push new data to the worker."""
         with self._lock:
             self.latest_frame = frame
@@ -111,6 +123,8 @@ class FrameProcessorThread(QtCore.QThread):
             self.live_roi = live_roi
             self.basic_recovery_mode = basic_recovery
             self.colormap_name = colormap_name
+            self.pattern_seq = pattern_seq
+            self.pattern_idx = pattern_idx
 
     def stop(self):
         self._is_running = False
@@ -130,6 +144,9 @@ class FrameProcessorThread(QtCore.QThread):
                 live_roi = self.live_roi
                 basic_recovery = self.basic_recovery_mode
                 cmap_name = self.colormap_name
+                # Capture to local variables!
+                thread_seq = self.pattern_seq 
+                thread_idx = self.pattern_idx
 
             # 2. Check if we actually have a new frame to process
             if frame is None or frame_count == last_processed_count:
@@ -140,32 +157,44 @@ class FrameProcessorThread(QtCore.QThread):
 
             try:
                 # 3. Process Dark Frame
-                image = frame.copy()
-                if image.ndim == 3:
-                    image = image[..., 0]
+                image_np = frame.copy()
+                if image_np.ndim == 3:
+                    image_np = image_np[..., 0]
 
-                if dark_frame is not None and dark_frame.shape == image.shape:
-                    corrected = image.astype(np.float32) - dark_frame
-                    np.clip(corrected, 0.0, 255.0, out=corrected)
-                    image = corrected.astype(np.uint8)
+                image_t = torch.from_numpy(image_np).to(self.device, dtype=torch.float32)
 
+                # 3. Process Dark Frame on GPU
+                if dark_frame is not None and dark_frame.shape == image_np.shape:
+                    # Only upload dark frame to GPU if it changed
+                    if dark_frame is not self._last_dark_frame_ref:
+                        self._dark_frame_gpu = torch.from_numpy(dark_frame).to(self.device, dtype=torch.float32)
+                        self._last_dark_frame_ref = dark_frame
+                    
+                    image_t = torch.clamp(image_t - self._dark_frame_gpu, 0.0, 255.0)
+                
+                # We need a CPU uint8 copy for ROI intensity math and final payload
+                image_corrected_np = image_t.detach().cpu().to(torch.uint8).numpy()
+                image = image_corrected_np
+                
                 # 4. Calculate Live ROI Intensity
                 roi_sum = None
                 roi_mean = None
                 if live_roi is not None:
                     x0, y0, x1, y1 = live_roi
-                    roi_patch = image[y0:y1, x0:x1]
+                    roi_patch = image_np[y0:y1, x0:x1]
                     if roi_patch.size > 0:
                         roi_sum = float(np.sum(roi_patch, dtype=np.float64))
                         roi_mean = float(np.mean(roi_patch))
-
-                # 5. Heavy Math: FFT
-                float_image = image.astype(np.float32)
-                fft_complex = np.fft.fft2(float_image)
-                fft_shifted = np.fft.fftshift(fft_complex)
-                magnitude = np.abs(fft_shifted)
-                magnitude_log = np.log1p(magnitude)
-                fft_image = cv_normalize_to_uint8(magnitude_log)
+             
+                # 5. Heavy Math: PyTorch FFT section
+                fft_complex = torch.fft.fft2(image_t)
+                fft_shifted = torch.fft.fftshift(fft_complex)
+                
+                magnitude = torch.abs(fft_shifted)
+                magnitude_log = torch.log1p(magnitude)
+                
+                # Bring log magnitude back to CPU for OpenCV normalization util
+                fft_image = cv_normalize_to_uint8(magnitude_log.detach().cpu().numpy())
 
                 # 6. Heavy Math: Field Recovery & Colormap
                 recovered_field = None
@@ -174,25 +203,40 @@ class FrameProcessorThread(QtCore.QThread):
                 if fft_roi is not None:
                     x0, y0, x1, y1 = fft_roi
                     if x1 - x0 >= 3 and y1 - y0 >= 3:
-                        filtered = np.zeros_like(fft_shifted)
+                        filtered = torch.zeros_like(fft_shifted)
                         filtered[y0:y1, x0:x1] = fft_shifted[y0:y1, x0:x1]
                         
                         if basic_recovery:
+                            # Do Basic Recovery entirely on the GPU
+                            filtered_t = torch.zeros_like(fft_shifted)
+                            filtered_t[y0:y1, x0:x1] = fft_shifted[y0:y1, x0:x1]
+                            
                             height, width = fft_shifted.shape[:2]
-                            roi_center_x = (x0 + x1) // 2
-                            roi_center_y = (y0 + y1) // 2
-                            target_center_x = width // 2
-                            target_center_y = height // 2
-                            shift_x = target_center_x - roi_center_x
-                            shift_y = target_center_y - roi_center_y
-                            centered = np.roll(filtered, shift=(shift_y, shift_x), axis=(0, 1))
-                            recovered_field = np.fft.ifft2(np.fft.ifftshift(centered))
+                            shift_x = (width // 2) - ((x0 + x1) // 2)
+                            shift_y = (height // 2) - ((y0 + y1) // 2)
+                            
+                            centered_t = torch.roll(filtered_t, shifts=(shift_y, shift_x), dims=(0, 1))
+                            recovered_field_t = torch.fft.ifft2(torch.fft.ifftshift(centered_t))
+                            
+                            # Pull the final recovered field back to CPU
+                            recovered_field = recovered_field_t.detach().cpu().numpy()
                         else:
-                            peak_y_f, peak_x_f = estimate_subpixel_peak_in_roi(np.abs(fft_shifted), fft_roi)
-                            recovered_field = demodulate_to_center_no_ref(filtered, peak_y_f, peak_x_f)
-                            recovered_field = remove_linear_phase_tilt_blind(recovered_field)
-                            recovered_field = remove_global_phase_offset_blind(recovered_field)
-                        
+                            #peak_y_f, peak_x_f = estimate_subpixel_peak_in_roi(np.abs(fft_shifted), fft_roi)
+                            #recovered_field = demodulate_to_center_no_ref(filtered, peak_y_f, peak_x_f)
+                            #recovered_field = remove_linear_phase_tilt_blind(recovered_field)
+                            #recovered_field = remove_global_phase_offset_blind(recovered_field)
+                            
+                            # Advanced recovery relies on your external numpy utility functions.
+                            # We must pull the shifted FFT back to CPU to use them.
+
+                            peak_y_f, peak_x_f = estimate_subpixel_peak_in_roi_torch(torch.abs(fft_shifted), fft_roi)
+                            recovered_field = demodulate_to_center_no_ref_torch(filtered, peak_y_f, peak_x_f)
+                            recovered_field = remove_linear_phase_tilt_blind_torch(recovered_field)
+                            recovered_field = remove_global_phase_offset_blind_torch(recovered_field)    
+                            
+                            recovered_field = recovered_field.detach().cpu().numpy()
+
+
                         # Generate the RGB colormap representation entirely in the background thread
                         if recovered_field is not None:
                             amplitude = np.abs(recovered_field)
@@ -202,8 +246,26 @@ class FrameProcessorThread(QtCore.QThread):
                                 recovered_phase, value=amplitude_norm, cmap_name=cmap_name
                             )
 
+                # 7. Ship it back to the main thread in a stamped dictionary
+                payload = {
+                    "frame_count": frame_count,
+                    "image": image,
+                    "fft_image": fft_image,
+                    "recovered_field": recovered_field,
+                    "phase_rgb": phase_rgb,
+                    "roi_sum": roi_sum,
+                    "roi_mean": roi_mean,
+                    "pattern_seq": thread_seq, # Stamped Sequence
+                    "pattern_idx": thread_idx  # Stamped Index
+                }
+                self.frame_processed.emit(payload)
+
+            except Exception as e:
+                self.error_occurred.emit(f"Processor Thread Error: {e}")
+
+
                 # 7. Ship it back to the main thread!
-                self.frame_processed.emit(frame_count, image, fft_image, recovered_field, phase_rgb, roi_sum, roi_mean)
+                #self.frame_processed.emit(frame_count, image, fft_image, recovered_field, phase_rgb, roi_sum, roi_mean)
 
             except Exception as e:
                 self.error_occurred.emit(f"Processor Thread Error: {e}")
@@ -1827,6 +1889,8 @@ class LiveCameraWindow(QMainWindow):
         self._frame_lock = threading.Lock()
         self._latest_frame = None
         self._frame_count = 0
+
+        self._last_ui_update_time = 0.0
 
         self._last_frame_error: Optional[str] = None
         self._master_dark_frame: Optional[np.ndarray] = None
@@ -4629,7 +4693,9 @@ class LiveCameraWindow(QMainWindow):
                 fft_roi=self._fft_roi,
                 live_roi=self._live_roi,
                 basic_recovery=self.basic_recovery_radio.isChecked(),
-                colormap_name=self._phase_colormap_name # <-- ADD THIS
+                colormap_name=self._phase_colormap_name,
+                pattern_seq=self._active_pattern_upload_sequence, # NEW
+                pattern_idx=self._current_plm_pattern_index       # NEW
             )
         finally:
             cam.queue_frame(frame)
@@ -7129,66 +7195,79 @@ class LiveCameraWindow(QMainWindow):
         self._set_status(err_msg)
         self.fft_status_label.setText("Thread error, check status bar.")
 
-
-    @QtCore.pyqtSlot(int, np.ndarray, np.ndarray, object, object, object, object)
-    def _on_frame_processed(self, frame_count, image, fft_image, recovered_field, phase_rgb, roi_sum, roi_mean):
-        # 1. Base Image & Phase Calibration Tracker
+    @QtCore.pyqtSlot(dict)
+    def _on_frame_processed(self, payload):
+        # 1. Unpack the payload
+        frame_count = payload["frame_count"]
+        image = payload["image"]
+        fft_image = payload["fft_image"]
+        recovered_field = payload["recovered_field"]
+        phase_rgb = payload["phase_rgb"]
+        roi_sum = payload["roi_sum"]
+        roi_mean = payload["roi_mean"]
+        pattern_seq = payload["pattern_seq"] # This guarantees sync!
+        
         self._last_processed_frame_count = frame_count
-        self.image_label.set_image_array(image)
-        self._handle_phase_calibration_frame(image, frame_count)
 
-        # 2. Live ROI UI Updates
+        # --- DATA PROCESSING (Always execute to prevent missing data) ---
+        
+        self._handle_phase_calibration_frame(image, frame_count)
+        self._latest_recovered_field = recovered_field
+
         if roi_sum is not None and roi_mean is not None:
-            self.live_roi_intensity_label.setText(
-                f"Live ROI sum intensity: {roi_sum:.3f} | mean={roi_mean:.3f}"
-            )
             self._append_live_intensity_sample(roi_sum)
 
-        # 3. FFT UI Updates
-        self.fft_image_label.set_image_array(fft_image)
-        if self._fft_roi is None:
-            self.fft_status_label.setText(
-                f"2D FFT updated. Frames processed: {frame_count}. Draw ROI around first order."
-            )
-
-        # 4. Recovered Field Pipeline
-        self._latest_recovered_field = recovered_field
-        
         if recovered_field is not None and phase_rgb is not None:
-            # Update Image
-            self.recovered_field_label.set_image_rgb_array(phase_rgb)
+            # Overwrite the class sequences with the stamped sequence just for storage
+            # This is the magic that fixes the gallery mismatch!
+            original_seq = self._pattern_upload_sequence
+            self._pattern_upload_sequence = pattern_seq 
             
-            # Fire downstream logic triggers
             self._store_pattern_field_if_ready(recovered_field)
             self._store_recovered_mode_if_ready(recovered_field)
-            self._maybe_step_continuous_zernike_optimizer()
             self._capture_pattern_preview_if_ready(phase_rgb)
             
-            # Update Readouts & Logs
-            p1, p2 = self.recovered_field_label.get_points()
-            self._update_recovered_point_readout(p1, p2)
+            # Restore sequence
+            self._pattern_upload_sequence = original_seq
             
-            x0, y0, x1, y1 = self._fft_roi if self._fft_roi is not None else (0, 0, 0, 0)
-            self.recovered_field_status_label.setText(
-                f"Recovered phase (amplitude-weighted RGB) updated from ROI x={x0}:{x1}, y={y0}:{y1}."
-            )
+            self._maybe_step_continuous_zernike_optimizer()
             self._maybe_log_current_measurement(frame_count)
             
-        else:
-            # Handle the "No ROI" or "Invalid ROI" state
+            p1, p2 = self.recovered_field_label.get_points()
+            self._update_recovered_point_readout(p1, p2)
+
+        # --- UI DRAWING THROTTLE (Max ~30 FPS to stop mouse lag) ---
+        now = perf_counter()
+        if now - self._last_ui_update_time > 0.033: 
+            self._last_ui_update_time = now
+            
+            # Only update the heavy image labels here
+            self.image_label.set_image_array(image)
+            self.fft_image_label.set_image_array(fft_image)
+            
+            if phase_rgb is not None:
+                self.recovered_field_label.set_image_rgb_array(phase_rgb)
+
+            # Update text labels
+            if roi_sum is not None:
+                self.live_roi_intensity_label.setText(
+                    f"Live ROI sum intensity: {roi_sum:.3f} | mean={roi_mean:.3f}"
+                )
+            
             if self._fft_roi is None:
-                self.recovered_field_status_label.setText("Select FFT ROI to recover amplitude-weighted phase.")
-            else:
-                self.recovered_field_status_label.setText("ROI too small or invalid for recovery.")
-                
-            self.point1_label.setText("P1: not available")
-            self.point2_label.setText("P2: not available")
-            self.phase_diff_label.setText("Δφ(P1-P2): n/a")
+                self.fft_status_label.setText(
+                    f"2D FFT updated. Frames processed: {frame_count}. Draw ROI around first order."
+                )
+                self.recovered_field_status_label.setText("Select FFT ROI to recover field.")
+            elif recovered_field is not None:
+                x0, y0, x1, y1 = self._fft_roi
+                self.recovered_field_status_label.setText(
+                    f"Recovered phase updated from ROI x={x0}:{x1}, y={y0}:{y1}."
+                )
+            
+            self._set_status(f"Live view started. Frames received: {frame_count}")
 
-        # 5. Global Status Update
-        self._set_status(f"Live view started. Frames received: {frame_count}")
-
-
+    '''
     def _compute_fft_shifted_and_magnitude_image(
         self, image: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -7201,6 +7280,7 @@ class LiveCameraWindow(QMainWindow):
 
         magnitude_norm = cv_normalize_to_uint8(magnitude_log)
         return fft_shifted, magnitude_norm
+
 
     def _recover_off_axis_field(self, fft_shifted: np.ndarray) -> Optional[np.ndarray]:
         roi = self._fft_roi
@@ -7230,7 +7310,8 @@ class LiveCameraWindow(QMainWindow):
         recovered_field = remove_linear_phase_tilt_blind(recovered_field)
         recovered_field = remove_global_phase_offset_blind(recovered_field)
         return recovered_field
-    
+    '''
+
     def closeEvent(self, event):
         # self.timer.stop()
         self._phase_cal_running = False
@@ -7244,11 +7325,6 @@ class LiveCameraWindow(QMainWindow):
                 pass
             self._streaming = False
         super().closeEvent(event)
-
-
-
-
-
 
 
 def main() -> int:

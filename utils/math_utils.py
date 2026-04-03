@@ -16,7 +16,6 @@ def wrap_phase_to_pi(phase_rad: float) -> float:
 def wrap_phase_to_2pi(phase_rad: float) -> float:
     return float((phase_rad + 2.0 * np.pi) % (2.0 * np.pi))
 
-
 def wrap_phase_array_to_pi(phase: np.ndarray) -> np.ndarray:
     return np.asarray((phase + np.pi) % (2.0 * np.pi) - np.pi, dtype=np.float32)
 
@@ -58,18 +57,36 @@ def cv_normalize_to_uint8(image: np.ndarray) -> np.ndarray:
     return (normalized * 255.0).astype(np.uint8)
 
 
+_CMAP_LUTS = {}
+
 def phase_to_rgb_uint8(
     phase: np.ndarray,
     value: Optional[np.ndarray] = None,
     cmap_name: str = "viridis",
 ) -> np.ndarray:
-    h = np.mod((phase + np.pi) / (2.0 * np.pi), 1.0)
-    rgb = mpl.colormaps[cmap_name](h)[..., :3].astype(np.float32)
-
+    
+    # 1. Fetch or build the LUT once
+    if cmap_name not in _CMAP_LUTS:
+        # Precompute 256 RGB values
+        cmap = mpl.colormaps[cmap_name]
+        lut = cmap(np.linspace(0, 1, 256))[:, :3] * 255.0
+        _CMAP_LUTS[cmap_name] = lut.astype(np.uint8)
+        
+    lut = _CMAP_LUTS[cmap_name]
+    
+    # 2. Fast mapping: Normalize phase to 0-255 integer indices
+    # (phase + pi) / 2pi -> mapped to 0-255
+    phase_norm = np.clip((phase + np.pi) / (2.0 * np.pi) * 255.0, 0, 255).astype(np.uint8)
+    
+    # 3. Fast indexing (Replaces the slow Matplotlib call)
+    rgb = lut[phase_norm]
+    
+    # 4. Apply amplitude weighting
     if value is not None:
         v = np.clip(value.astype(np.float32), 0.0, 1.0)
-        rgb *= v[..., None]
-
-    return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+        # Fast broadcasting
+        rgb = (rgb.astype(np.float32) * v[..., None]).astype(np.uint8)
+        
+    return rgb
 
 

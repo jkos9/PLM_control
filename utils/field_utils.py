@@ -2,6 +2,130 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
+def estimate_subpixel_peak_in_roi_torch(
+    magnitude: torch.Tensor,
+    roi: tuple[int, int, int, int],
+    eps: float = 1e-12,
+) -> tuple[float, float]:
+    
+    x0, y0, x1, y1 = roi
+    patch = torch.clamp(magnitude[y0:y1, x0:x1], min=0.0)
+    
+    if patch.numel() == 0:
+        return float((y0 + y1) * 0.5), float((x0 + x1) * 0.5)
+
+    device = magnitude.device
+    height, width = patch.shape
+    
+    # Generate grids on the same device as the magnitude tensor
+    y = torch.arange(height, dtype=torch.float64, device=device)
+    x = torch.arange(width, dtype=torch.float64, device=device)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    
+    weights = patch.to(torch.float64)
+    weight_sum = torch.sum(weights)
+    
+    if weight_sum <= eps:
+        return float((y0 + y1) * 0.5), float((x0 + x1) * 0.5)
+
+    # .item() brings the single scalar value back to the CPU 
+    # to match your original float return signature.
+    py = (torch.sum((yy + y0) * weights) / weight_sum).item()
+    px = (torch.sum((xx + x0) * weights) / weight_sum).item()
+    
+    return py, px
+
+
+def demodulate_to_center_no_ref_torch(
+    fft_filtered: torch.Tensor,
+    peak_y_f: float,
+    peak_x_f: float,
+) -> torch.Tensor:
+    
+    height, width = fft_filtered.shape[:2]
+    center_y = (height - 1) / 2.0
+    center_x = (width - 1) / 2.0
+    
+    dy = center_y - float(peak_y_f)
+    dx = center_x - float(peak_x_f)
+    
+    dy_i = int(round(dy))
+    dx_i = int(round(dx))
+    
+    fft_integer_shifted = torch.roll(fft_filtered, shifts=(dy_i, dx_i), dims=(0, 1))
+    
+    dy_f = dy - dy_i
+    dx_f = dx - dx_i
+    
+    recovered = torch.fft.ifft2(torch.fft.ifftshift(fft_integer_shifted))
+    
+    device = fft_filtered.device
+    y = torch.arange(height, dtype=torch.float32, device=device)
+    x = torch.arange(width, dtype=torch.float32, device=device)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    
+    # 1j works natively in PyTorch for complex numbers
+    frac_ramp = torch.exp(-1j * 2.0 * torch.pi * ((dx_f * xx / width) + (dy_f * yy / height)))
+    
+    return recovered * frac_ramp
+
+
+def remove_linear_phase_tilt_blind_torch(
+    field: torch.Tensor,
+    amp_thresh: float = 0.2,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    
+    amp = torch.abs(field)
+    amp_max = torch.max(amp)
+    
+    if amp_max <= eps:
+        return field
+
+    mask = amp > (amp_thresh * amp_max)
+    field_conj = torch.conj(field)
+    
+    gx_num = torch.sum(field_conj[:, :-1] * field[:, 1:] * mask[:, :-1])
+    gy_num = torch.sum(field_conj[:-1, :] * field[1:, :] * mask[:-1, :])
+    
+    gx = torch.angle(gx_num) if torch.abs(gx_num) > eps else torch.tensor(0.0, device=field.device)
+    gy = torch.angle(gy_num) if torch.abs(gy_num) > eps else torch.tensor(0.0, device=field.device)
+    
+    height, width = field.shape[:2]
+    device = field.device
+    y = torch.arange(height, dtype=torch.float32, device=device)
+    x = torch.arange(width, dtype=torch.float32, device=device)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    
+    ramp = torch.exp(-1j * (gx * xx + gy * yy))
+    return field * ramp
+
+
+def remove_global_phase_offset_blind_torch(
+    field: torch.Tensor,
+    amp_thresh: float = 0.2,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    
+    amp = torch.abs(field)
+    amp_max = torch.max(amp)
+    
+    if amp_max <= eps:
+        return field
+        
+    mask = amp > (amp_thresh * amp_max)
+    
+    if not torch.any(mask):
+        return field
+
+    phase_ref_complex = torch.sum(field[mask])
+    
+    if torch.abs(phase_ref_complex) <= eps:
+        return field
+
+    phase_ref = torch.angle(phase_ref_complex)
+    return field * torch.exp(-1j * phase_ref)
+
 
 def estimate_subpixel_peak_in_roi(
     magnitude: np.ndarray,
