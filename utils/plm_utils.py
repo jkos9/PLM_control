@@ -8,14 +8,14 @@ import sys
 # Force local workspace package first so DB comes from PLM_NIR_control/src/ti_plm/db
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from ti_plm import PLM
-from ti_plm.display import ImageWindow, EventLoopExit
+#from ti_plm import PLM
+#from ti_plm.display import ImageWindow, EventLoopExit
 from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from time import perf_counter, sleep
 from tqdm import tqdm
-from utils.holo_utils import generate_checkerboard, generate_line_pattern, plot_phase_map, generate_global_pattern
+#from utils.holo_utils import generate_checkerboard, generate_line_pattern, plot_phase_map, generate_global_pattern
 
 
 def get_phase_values_from_calibration(plm: PLM) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -44,3 +44,30 @@ def get_phase_values_from_calibration(plm: PLM) -> tuple[np.ndarray, np.ndarray,
     return phase_levels, buckets, reps
 
     
+
+def get_phase_values_from_calibration(
+    plm: PLM,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+
+    phase_min, phase_max = plm.phase_range
+    n_states = len(plm.displacement_ratios)
+    ratio_scale = (
+        plm.max_displacement_ratio
+        if plm.max_displacement_ratio is not None
+        else (n_states - 1) / n_states
+    )
+
+    phase_levels = phase_min + plm.displacement_ratios * ratio_scale * (
+        phase_max - phase_min
+    )
+
+    phase_disp = np.hstack([phase_levels, phase_max])
+    buckets = (phase_disp[:-1] + phase_disp[1:]) / 2.0
+    representative_values = np.empty(n_states, dtype=np.float64)
+    representative_values[0] = phase_min + 1e-9
+    if n_states > 1:
+
+        representative_values[1:] = 0.5 * (buckets[:-1] + buckets[1:])
+    return phase_levels, buckets, representative_values
+
+

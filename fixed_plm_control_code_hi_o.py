@@ -15,6 +15,10 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from PIL import Image
 from vmbpy import PixelFormat, VmbSystem
 
+from utils.math_utils import *
+from utils.field_utils import *
+#from utils.plm_utils import *
+
 
 try:
     import torch
@@ -28,6 +32,10 @@ except Exception:
 # Ensure local package imports work when running this file directly.
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+
+
+
 
 try:
     QtCore = importlib.import_module("PyQt5.QtCore")
@@ -60,61 +68,79 @@ try:
     QScrollArea = QtWidgets.QScrollArea
 
     QSplitter = QtWidgets.QSplitter
-
     QSpinBox = QtWidgets.QSpinBox
-
     QTabWidget = QtWidgets.QTabWidget
-
     QButtonGroup = QtWidgets.QButtonGroup
-
     QVBoxLayout = QtWidgets.QVBoxLayout
-
     QWidget = QtWidgets.QWidget
 
 except ImportError as exc:
-
     raise ImportError("PyQt5 is required. Install with: pip install PyQt5") from exc
 
 
 from ti_plm import PLM
-
 from ti_plm.display import EventLoopExit, ImageWindow
 
 
+class FrameProcessorThread(QtCore.QThread):
+    # Payload: frame_count, image, fft_image, recovered_field, phase_rgb, roi_sum, roi_mean
+    frame_processed = QtCore.pyqtSignal(int, np.ndarray, np.ndarray, object, object, object, object)
+    error_occurred = QtCore.pyqtSignal(str)
 
-class FrameProcessor(QtCore.QThread):
-    # Signals to send processed data back to the GUI safely.
-    processed_images_ready = QtCore.pyqtSignal(np.ndarray, np.ndarray, object, object, int)
-    processing_error = QtCore.pyqtSignal(str)
-    
-    def __init__(self, main_window):
-        super().__init__()
-        self.main_window = main_window
-        self.running = False
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._is_running = False
+        self._lock = threading.Lock()
+        
+        # Shared state written by Main Thread, read by Worker Thread
+        self.latest_frame = None
+        self.frame_count = 0
+        self.master_dark_frame = None
+        self.fft_roi = None
+        self.live_roi = None
+        self.basic_recovery_mode = True
+        self.colormap_name = "viridis"
 
-    def start_processing(self) -> None:
-        self.running = True
-        if not self.isRunning():
-            self.start()
+    def update_state(self, frame, count, dark_frame, fft_roi, live_roi, basic_recovery, colormap_name):
+        """Called by the main thread to push new data to the worker."""
+        with self._lock:
+            self.latest_frame = frame
+            self.frame_count = count
+            self.master_dark_frame = dark_frame
+            self.fft_roi = fft_roi
+            self.live_roi = live_roi
+            self.basic_recovery_mode = basic_recovery
+            self.colormap_name = colormap_name
 
-    def stop_processing(self, wait_ms: int = 1500) -> None:
-        self.running = False
-        if self.isRunning():
-            self.wait(max(0, int(wait_ms)))
+    def stop(self):
+        self._is_running = False
+        self.wait()
 
     def run(self):
-        while self.running:
+        self._is_running = True
+        last_processed_count = -1
+
+        while self._is_running:
+            # 1. Safely grab the latest inputs
+            with self._lock:
+                frame = self.latest_frame
+                frame_count = self.frame_count
+                dark_frame = self.master_dark_frame
+                fft_roi = self.fft_roi
+                live_roi = self.live_roi
+                basic_recovery = self.basic_recovery_mode
+                cmap_name = self.colormap_name
+
+            # 2. Check if we actually have a new frame to process
+            if frame is None or frame_count == last_processed_count:
+                self.msleep(10) # Prevent CPU pegging
+                continue
+
+            last_processed_count = frame_count
+
             try:
-                with self.main_window._frame_lock:
-                    frame = self.main_window._latest_frame
-                    frame_count = int(self.main_window._frame_count)
-                    dark_frame = self.main_window._master_dark_frame
-
-                if frame is None:
-                    self.msleep(8)
-                    continue
-
-                image = frame
+                # 3. Process Dark Frame
+                image = frame.copy()
                 if image.ndim == 3:
                     image = image[..., 0]
 
@@ -123,46 +149,70 @@ class FrameProcessor(QtCore.QThread):
                     np.clip(corrected, 0.0, 255.0, out=corrected)
                     image = corrected.astype(np.uint8)
 
-                fft_roi = self.main_window._fft_roi
-                use_basic_recovery = bool(self.main_window._use_basic_recovery)
+                # 4. Calculate Live ROI Intensity
+                roi_sum = None
+                roi_mean = None
+                if live_roi is not None:
+                    x0, y0, x1, y1 = live_roi
+                    roi_patch = image[y0:y1, x0:x1]
+                    if roi_patch.size > 0:
+                        roi_sum = float(np.sum(roi_patch, dtype=np.float64))
+                        roi_mean = float(np.mean(roi_patch))
 
-                fft_shifted, fft_image = (
-                    self.main_window._compute_fft_shifted_and_magnitude_image(image)
-                )
-                recovered_field = self.main_window._recover_off_axis_field(
-                    fft_shifted,
-                    roi=fft_roi,
-                    use_basic_recovery=use_basic_recovery,
-                )
+                # 5. Heavy Math: FFT
+                float_image = image.astype(np.float32)
+                fft_complex = np.fft.fft2(float_image)
+                fft_shifted = np.fft.fftshift(fft_complex)
+                magnitude = np.abs(fft_shifted)
+                magnitude_log = np.log1p(magnitude)
+                fft_image = cv_normalize_to_uint8(magnitude_log)
 
+                # 6. Heavy Math: Field Recovery & Colormap
+                recovered_field = None
                 phase_rgb = None
-                if isinstance(recovered_field, np.ndarray):
-                    amplitude = np.abs(recovered_field)
-                    amplitude_norm = amplitude / (float(np.max(amplitude)) + 1e-12)
-                    recovered_phase = np.angle(recovered_field)
-                    phase_rgb = phase_to_rgb_uint8(
-                        recovered_phase,
-                        value=amplitude_norm,
-                        cmap_name=self.main_window._phase_colormap_name,
-                    )
+                
+                if fft_roi is not None:
+                    x0, y0, x1, y1 = fft_roi
+                    if x1 - x0 >= 3 and y1 - y0 >= 3:
+                        filtered = np.zeros_like(fft_shifted)
+                        filtered[y0:y1, x0:x1] = fft_shifted[y0:y1, x0:x1]
+                        
+                        if basic_recovery:
+                            height, width = fft_shifted.shape[:2]
+                            roi_center_x = (x0 + x1) // 2
+                            roi_center_y = (y0 + y1) // 2
+                            target_center_x = width // 2
+                            target_center_y = height // 2
+                            shift_x = target_center_x - roi_center_x
+                            shift_y = target_center_y - roi_center_y
+                            centered = np.roll(filtered, shift=(shift_y, shift_x), axis=(0, 1))
+                            recovered_field = np.fft.ifft2(np.fft.ifftshift(centered))
+                        else:
+                            peak_y_f, peak_x_f = estimate_subpixel_peak_in_roi(np.abs(fft_shifted), fft_roi)
+                            recovered_field = demodulate_to_center_no_ref(filtered, peak_y_f, peak_x_f)
+                            recovered_field = remove_linear_phase_tilt_blind(recovered_field)
+                            recovered_field = remove_global_phase_offset_blind(recovered_field)
+                        
+                        # Generate the RGB colormap representation entirely in the background thread
+                        if recovered_field is not None:
+                            amplitude = np.abs(recovered_field)
+                            amplitude_norm = amplitude / (float(np.max(amplitude)) + 1e-12)
+                            recovered_phase = np.angle(recovered_field)
+                            phase_rgb = phase_to_rgb_uint8(
+                                recovered_phase, value=amplitude_norm, cmap_name=cmap_name
+                            )
 
-                self.processed_images_ready.emit(
-                    image,
-                    fft_image,
-                    recovered_field,
-                    phase_rgb,
-                    frame_count,
-                )
-                self.msleep(8)
+                # 7. Ship it back to the main thread!
+                self.frame_processed.emit(frame_count, image, fft_image, recovered_field, phase_rgb, roi_sum, roi_mean)
 
-            except Exception as exc:
-                self.processing_error.emit(f"Processing error: {exc}")
-                self.msleep(15)
-
+            except Exception as e:
+                self.error_occurred.emit(f"Processor Thread Error: {e}")
 
 
 class RoiSelectableImageLabel(QLabel):
+
     def __init__(self, text: str = "", parent=None):
+
         super().__init__(text, parent)
         self.setMouseTracking(True)
         self._image_shape: Optional[tuple[int, int]] = None
@@ -195,38 +245,57 @@ class RoiSelectableImageLabel(QLabel):
         self._refresh_display()
 
     def get_roi_rect(self) -> Optional[tuple[int, int, int, int]]:
+
         return self._roi_rect
 
     def clear_roi(self) -> None:
+
         self._roi_rect = None
+
         self._drag_start = None
+
         self._drag_end = None
+
         self._refresh_display()
 
         if self.on_roi_changed is not None:
+
             self.on_roi_changed(self._roi_rect)
 
     def resizeEvent(self, event) -> None:
+
         super().resizeEvent(event)
+
         self._refresh_display()
 
     def mousePressEvent(self, event) -> None:
+
         if event.button() != Qt.LeftButton:
+
             super().mousePressEvent(event)
+
             return
 
         mapped = self._label_pos_to_image_pos(event.pos().x(), event.pos().y())
+
         if mapped is None:
+
             return
 
         self._dragging = True
+
         self._drag_start = mapped
+
         self._drag_end = mapped
+
         self._refresh_display()
 
     def mouseMoveEvent(self, event) -> None:
+
         if not self._dragging:
+
             super().mouseMoveEvent(event)
+
             return
 
         mapped = self._label_pos_to_image_pos(event.pos().x(), event.pos().y())
@@ -1750,6 +1819,9 @@ class LiveCameraWindow(QMainWindow):
         container.setLayout(root)
 
         self.setCentralWidget(container)
+        #self.timer = QTimer(self)
+        #self.timer.setInterval(30)
+        #self.timer.timeout.connect(self._update_frame)
         self._streaming = False
 
         self._frame_lock = threading.Lock()
@@ -1760,15 +1832,6 @@ class LiveCameraWindow(QMainWindow):
         self._master_dark_frame: Optional[np.ndarray] = None
         self._live_roi: Optional[tuple[int, int, int, int]] = None
         self._fft_roi: Optional[tuple[int, int, int, int]] = None
-        self._use_basic_recovery = bool(self.basic_recovery_radio.isChecked())
-        self._trigger_mode_cached = str(self.trigger_mode_combo.currentData() or "freerun")
-        self._trigger_delay_ms_cached = 0.0
-
-        self._frame_processor = FrameProcessor(self)
-        self._frame_processor.processed_images_ready.connect(
-            self._on_processed_images_ready
-        )
-        self._frame_processor.processing_error.connect(self._on_processing_error)
 
         self._latest_recovered_field: Optional[np.ndarray] = None
 
@@ -1972,6 +2035,10 @@ class LiveCameraWindow(QMainWindow):
 
         self._plot_refresh_timer = QTimer(self)
 
+        self.processor_thread = FrameProcessorThread(self)
+        self.processor_thread.frame_processed.connect(self._on_frame_processed)
+        self.processor_thread.error_occurred.connect(self._on_processor_error)
+
         self._plot_refresh_timer.setInterval(100)
 
         self._plot_refresh_timer.timeout.connect(self._refresh_plots_if_dirty)
@@ -2013,7 +2080,6 @@ class LiveCameraWindow(QMainWindow):
         self.trigger_delay_edit.editingFinished.connect(
             self._on_trigger_delay_editing_finished
         )
-        self.trigger_mode_combo.currentIndexChanged.connect(self._on_trigger_mode_changed)
 
         self.grating_x_edit.editingFinished.connect(self._on_grating_input_changed)
 
@@ -2050,10 +2116,6 @@ class LiveCameraWindow(QMainWindow):
         self.colormap_viridis_radio.toggled.connect(self._on_colormap_toggled)
 
         self.colormap_plasma_radio.toggled.connect(self._on_colormap_toggled)
-
-        self.basic_recovery_radio.toggled.connect(self._on_recovery_mode_toggled)
-
-        self.stabilized_recovery_radio.toggled.connect(self._on_recovery_mode_toggled)
 
         self.tab_widget.currentChanged.connect(self._on_left_tab_changed)
 
@@ -2139,7 +2201,6 @@ class LiveCameraWindow(QMainWindow):
 
         self._initialize_exposure_controls()
         self._initialize_trigger_delay_controls()
-        self._trigger_delay_ms_cached = self._get_trigger_delay_ms_from_ui_raw()
         self._on_grating_input_changed()
         self._update_zernike_visibility()
         self._on_zernike_coeff_changed(0.0)
@@ -2177,131 +2238,6 @@ class LiveCameraWindow(QMainWindow):
 
     def _on_right_tab_changed(self, _index: int) -> None:
         self._refresh_plots_if_dirty(force=True)
-
-    def _on_processing_error(self, message: str) -> None:
-        self._set_status(message)
-        self.fft_status_label.setText(message)
-        self.recovered_field_status_label.setText(message)
-
-    def _on_trigger_mode_changed(self, _index: int) -> None:
-        self._trigger_mode_cached = str(self.trigger_mode_combo.currentData() or "freerun")
-
-    def _on_recovery_mode_toggled(self, _checked: bool) -> None:
-        self._use_basic_recovery = bool(self.basic_recovery_radio.isChecked())
-
-    def _on_processed_images_ready(
-        self,
-        image: np.ndarray,
-        fft_image: np.ndarray,
-        recovered_field: object,
-        phase_rgb: object,
-        frame_count: int,
-    ) -> None:
-
-        try:
-            if frame_count == self._last_processed_frame_count:
-                return
-
-            trigger_mode = str(self._trigger_mode_cached or "freerun")
-            if trigger_mode == "line1" and self._last_pattern_switch_time_s > 0.0:
-
-                settle_s = max(0.0, float(self._trigger_delay_ms_cached)) / 1000.0
-                if settle_s > 0.0:
-                    elapsed_s = perf_counter() - self._last_pattern_switch_time_s
-                    if elapsed_s < settle_s:
-                        self._last_processed_frame_count = frame_count
-                        if (
-                            self._current_plm_pattern_index is not None
-                            and self._current_plm_total_patterns is not None
-                        ):
-                            remaining_ms = max(0.0, (settle_s - elapsed_s) * 1000.0)
-                            self._set_status(
-                                f"Waiting settle after pattern{self._current_plm_pattern_index}/{self._current_plm_total_patterns}:{remaining_ms:.1f} ms"
-                            )
-                        return
-
-            if (
-                self._drop_frames_remaining > 0
-                and frame_count > self._drop_frames_start_count
-            ):
-                self._drop_frames_remaining -= 1
-                self._last_processed_frame_count = frame_count
-                if (
-                    self._current_plm_pattern_index is not None
-                    and self._current_plm_total_patterns is not None
-                ):
-                    self._set_status(
-                        f"Dropping frame after pattern{self._current_plm_pattern_index}/{self._current_plm_total_patterns}(remaining: {self._drop_frames_remaining})."
-                    )
-                return
-
-            self._last_processed_frame_count = frame_count
-            self.image_label.set_image_array(image)
-            self._handle_phase_calibration_frame(image, frame_count)
-            if self._live_roi is not None:
-                x0, y0, x1, y1 = self._live_roi
-                roi_patch = image[y0:y1, x0:x1]
-                if roi_patch.size > 0:
-                    roi_sum = float(np.sum(roi_patch, dtype=np.float64))
-                    roi_mean = float(np.mean(roi_patch))
-                    self.live_roi_intensity_label.setText(
-                        f"Live ROI sum intensity: {roi_sum:.3f} | mean={roi_mean:.3f}"
-                    )
-                    self._append_live_intensity_sample(roi_sum)
-
-            self.fft_image_label.set_image_array(fft_image)
-
-            if isinstance(recovered_field, np.ndarray):
-                self._latest_recovered_field = recovered_field
-                if isinstance(phase_rgb, np.ndarray):
-                    self.recovered_field_label.set_image_rgb_array(phase_rgb)
-                self._store_pattern_field_if_ready(recovered_field)
-                self._store_recovered_mode_if_ready(recovered_field)
-                self._maybe_step_continuous_zernike_optimizer()
-                if isinstance(phase_rgb, np.ndarray):
-                    self._capture_pattern_preview_if_ready(phase_rgb)
-                p1, p2 = self.recovered_field_label.get_points()
-                self._update_recovered_point_readout(p1, p2)
-                x0, y0, x1, y1 = (
-                    self._fft_roi if self._fft_roi is not None else (0, 0, 0, 0)
-                )
-                self.recovered_field_status_label.setText(
-                    f"Recovered phase (amplitude-weighted RGB) updated from ROI x={x0}:{x1}, y={y0}:{y1}."
-                )
-                self._maybe_log_current_measurement(frame_count)
-
-            elif self._fft_roi is None:
-
-                self._latest_recovered_field = None
-                self.recovered_field_status_label.setText(
-                    "Select FFT ROI to recover amplitude-weighted phase."
-                )
-
-                self.point1_label.setText("P1: not available")
-                self.point2_label.setText("P2: not available")
-                self.phase_diff_label.setText("Δφ(P1-P2): n/a")
-
-            else:
-                self._latest_recovered_field = None
-
-                self.recovered_field_status_label.setText(
-                    "ROI too small or invalid for recovery."
-                )
-
-                self.point1_label.setText("P1: not available")
-                self.point2_label.setText("P2: not available")
-                self.phase_diff_label.setText("Δφ(P1-P2): n/a")
-
-            self._set_status(f"Live view started. Frames received: {frame_count}")
-            if self._fft_roi is None:
-                self.fft_status_label.setText(
-                    f"2D FFT updated. Frames processed: {frame_count}. Draw ROI around first order."
-                )
-
-        except Exception as exc:
-            self._set_status(f"Render error: {exc}")
-            self.fft_status_label.setText(f"FFT render error: {exc}")
-            self.recovered_field_status_label.setText(f"Recovery error: {exc}")
 
     def _on_colormap_toggled(self, _checked: bool) -> None:
 
@@ -4448,7 +4384,6 @@ class LiveCameraWindow(QMainWindow):
     def _on_trigger_delay_editing_finished(self) -> None:
 
         trigger_delay_us = self._get_trigger_delay_us_from_ui()
-        self._trigger_delay_ms_cached = trigger_delay_us / 1000.0
 
         if self._trigger_delay_feature_name is None:
 
@@ -4479,108 +4414,77 @@ class LiveCameraWindow(QMainWindow):
             self._set_status(f"Failed to set trigger delay: {exc}")
 
     def _start_live(self) -> None:
-
         if self._streaming:
-
             return
 
         try:
-
             with self._frame_lock:
-
                 self._latest_frame = None
-
                 self._frame_count = 0
-
                 self._last_frame_error = None
 
             self._last_processed_frame_count = -1
-
             self._drop_frames_remaining = 0
-
             self._drop_frames_start_count = -1
-
             self._last_pattern_switch_time_s = 0.0
-
             trigger_mode = str(self.trigger_mode_combo.currentData() or "freerun")
-            self._trigger_mode_cached = trigger_mode
-            self._use_basic_recovery = bool(self.basic_recovery_radio.isChecked())
 
             if trigger_mode == "line1":
-
                 if hasattr(self.cam, "TriggerSelector"):
-
                     self.cam.TriggerSelector.set("FrameStart")
 
                 if hasattr(self.cam, "TriggerSource"):
-
                     self.cam.TriggerSource.set("Line1")
 
                 if hasattr(self.cam, "TriggerActivation"):
-
                     self.cam.TriggerActivation.set("RisingEdge")
 
                 if hasattr(self.cam, "TriggerMode"):
-
                     self.cam.TriggerMode.set("On")
 
                 if self._trigger_delay_feature_name is not None:
-
                     self._get_feature(self._trigger_delay_feature_name).set(
                         self._get_trigger_delay_us_from_ui()
                     )
 
             else:
-
                 if hasattr(self.cam, "TriggerMode"):
-
                     self.cam.TriggerMode.set("Off")
 
             if hasattr(self.cam, "AcquisitionMode"):
-
                 self.cam.AcquisitionMode.set("Continuous")
-
+                
+            self.processor_thread.start()
             self.cam.start_streaming(handler=self._frame_handler, buffer_count=5)
-
+            
             self._streaming = True
-            self._frame_processor.start_processing()
-
+            #self.timer.start()
             self.start_button.setEnabled(False)
-
             self.stop_button.setEnabled(True)
-
+            
             if trigger_mode == "line1":
-
                 self._set_status("Live view started (hardware trigger: Line1).")
 
             else:
-
                 self._set_status("Live view started (trigger: FreeRun).")
 
         except Exception as exc:
-
             self._set_status(f"Failed to start streaming: {exc}")
 
     def _stop_live(self) -> None:
-
-        self._frame_processor.stop_processing()
-
+        # self.timer.stop()
         if self._streaming:
-
             try:
-
                 self.cam.stop_streaming()
 
             except Exception as exc:
-
                 self._set_status(f"Failed to stop streaming cleanly: {exc}")
-
+        
+            self.processor_thread.stop()
             self._streaming = False
 
         self.start_button.setEnabled(True)
-
         self.stop_button.setEnabled(False)
-
         self._set_status("Live view stopped.")
 
     def _clear_dark_frame(self) -> None:
@@ -4707,31 +4611,29 @@ class LiveCameraWindow(QMainWindow):
 
             self.dark_frame_clear_button.setEnabled(True)
 
-    def _frame_handler(self, cam, stream, frame) -> None:
 
+    def _frame_handler(self, cam, stream, frame):
         try:
-
             frame_mono8 = frame.convert_pixel_format(PixelFormat.Mono8)
-
             image = frame_mono8.as_opencv_image().copy()
 
             with self._frame_lock:
-
                 self._latest_frame = image
-
                 self._frame_count += 1
-
-                self._last_frame_error = None
-
-        except Exception as exc:
-
-            with self._frame_lock:
-
-                self._last_frame_error = f"Callback error: {exc}"
-
+                
+            # Push the latest state to the worker thread safely
+            self.processor_thread.update_state(
+                frame=image,
+                count=self._frame_count,
+                dark_frame=self._master_dark_frame,
+                fft_roi=self._fft_roi,
+                live_roi=self._live_roi,
+                basic_recovery=self.basic_recovery_radio.isChecked(),
+                colormap_name=self._phase_colormap_name # <-- ADD THIS
+            )
         finally:
-
             cam.queue_frame(frame)
+
 
     def _on_auto_exposure_toggled(self, checked: bool) -> None:
 
@@ -7220,6 +7122,72 @@ class LiveCameraWindow(QMainWindow):
 
         self._phase_cal_latest_plm_phase_pattern = None
         self._refresh_phase_calibration_live_pattern_plot(None)
+    
+    
+    @QtCore.pyqtSlot(str)
+    def _on_processor_error(self, err_msg):
+        self._set_status(err_msg)
+        self.fft_status_label.setText("Thread error, check status bar.")
+
+
+    @QtCore.pyqtSlot(int, np.ndarray, np.ndarray, object, object, object, object)
+    def _on_frame_processed(self, frame_count, image, fft_image, recovered_field, phase_rgb, roi_sum, roi_mean):
+        # 1. Base Image & Phase Calibration Tracker
+        self._last_processed_frame_count = frame_count
+        self.image_label.set_image_array(image)
+        self._handle_phase_calibration_frame(image, frame_count)
+
+        # 2. Live ROI UI Updates
+        if roi_sum is not None and roi_mean is not None:
+            self.live_roi_intensity_label.setText(
+                f"Live ROI sum intensity: {roi_sum:.3f} | mean={roi_mean:.3f}"
+            )
+            self._append_live_intensity_sample(roi_sum)
+
+        # 3. FFT UI Updates
+        self.fft_image_label.set_image_array(fft_image)
+        if self._fft_roi is None:
+            self.fft_status_label.setText(
+                f"2D FFT updated. Frames processed: {frame_count}. Draw ROI around first order."
+            )
+
+        # 4. Recovered Field Pipeline
+        self._latest_recovered_field = recovered_field
+        
+        if recovered_field is not None and phase_rgb is not None:
+            # Update Image
+            self.recovered_field_label.set_image_rgb_array(phase_rgb)
+            
+            # Fire downstream logic triggers
+            self._store_pattern_field_if_ready(recovered_field)
+            self._store_recovered_mode_if_ready(recovered_field)
+            self._maybe_step_continuous_zernike_optimizer()
+            self._capture_pattern_preview_if_ready(phase_rgb)
+            
+            # Update Readouts & Logs
+            p1, p2 = self.recovered_field_label.get_points()
+            self._update_recovered_point_readout(p1, p2)
+            
+            x0, y0, x1, y1 = self._fft_roi if self._fft_roi is not None else (0, 0, 0, 0)
+            self.recovered_field_status_label.setText(
+                f"Recovered phase (amplitude-weighted RGB) updated from ROI x={x0}:{x1}, y={y0}:{y1}."
+            )
+            self._maybe_log_current_measurement(frame_count)
+            
+        else:
+            # Handle the "No ROI" or "Invalid ROI" state
+            if self._fft_roi is None:
+                self.recovered_field_status_label.setText("Select FFT ROI to recover amplitude-weighted phase.")
+            else:
+                self.recovered_field_status_label.setText("ROI too small or invalid for recovery.")
+                
+            self.point1_label.setText("P1: not available")
+            self.point2_label.setText("P2: not available")
+            self.phase_diff_label.setText("Δφ(P1-P2): n/a")
+
+        # 5. Global Status Update
+        self._set_status(f"Live view started. Frames received: {frame_count}")
+
 
     def _compute_fft_shifted_and_magnitude_image(
         self, image: np.ndarray
@@ -7234,14 +7202,8 @@ class LiveCameraWindow(QMainWindow):
         magnitude_norm = cv_normalize_to_uint8(magnitude_log)
         return fft_shifted, magnitude_norm
 
-    def _recover_off_axis_field(
-        self,
-        fft_shifted: np.ndarray,
-        roi: Optional[tuple[int, int, int, int]] = None,
-        use_basic_recovery: Optional[bool] = None,
-    ) -> Optional[np.ndarray]:
-        if roi is None:
-            roi = self._fft_roi
+    def _recover_off_axis_field(self, fft_shifted: np.ndarray) -> Optional[np.ndarray]:
+        roi = self._fft_roi
         if roi is None:
             return None
         x0, y0, x1, y1 = roi
@@ -7251,10 +7213,7 @@ class LiveCameraWindow(QMainWindow):
 
         filtered = np.zeros_like(fft_shifted)
         filtered[y0:y1, x0:x1] = fft_shifted[y0:y1, x0:x1]
-        if use_basic_recovery is None:
-            use_basic_recovery = bool(self.basic_recovery_radio.isChecked())
-
-        if use_basic_recovery:
+        if self.basic_recovery_radio.isChecked():
 
             height, width = fft_shifted.shape[:2]
             roi_center_x = (x0 + x1) // 2
@@ -7273,7 +7232,7 @@ class LiveCameraWindow(QMainWindow):
         return recovered_field
     
     def closeEvent(self, event):
-        self._frame_processor.stop_processing()
+        # self.timer.stop()
         self._phase_cal_running = False
         if self._plm_loop_thread is not None and self._plm_loop_thread.is_alive():
             self._plm_stop_event.set()
@@ -7287,127 +7246,26 @@ class LiveCameraWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def cv_normalize_to_uint8(image: np.ndarray) -> np.ndarray:
-    min_val = float(np.min(image))
-    max_val = float(np.max(image))
-    if max_val <= min_val:
-        return np.zeros_like(image, dtype=np.uint8)
-    normalized = (image - min_val) / (max_val - min_val)
-    return (normalized * 255.0).astype(np.uint8)
 
 
-def phase_to_rgb_uint8(
-    phase: np.ndarray,
-    value: Optional[np.ndarray] = None,
-    cmap_name: str = "viridis",
-) -> np.ndarray:
-    h = np.mod((phase + np.pi) / (2.0 * np.pi), 1.0)
-    rgb = mpl.colormaps[cmap_name](h)[..., :3].astype(np.float32)
-
-    if value is not None:
-        v = np.clip(value.astype(np.float32), 0.0, 1.0)
-        rgb *= v[..., None]
-
-    return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
 
 
-def normalize_modes_np(modes: np.ndarray) -> np.ndarray:
-    norm = np.sqrt(np.sum(np.abs(modes) ** 2, axis=(-2, -1), keepdims=True))
-    norm = np.maximum(norm, 1e-12)
-    return modes / norm
 
+def main() -> int:
+    app = QApplication(sys.argv)
 
-def normalize_modes_torch(modes):
-    norm = torch.sqrt(torch.sum(torch.abs(modes) ** 2, dim=(-2, -1), keepdim=True))
-    norm = torch.clamp(norm, min=1e-12)
-    return modes / norm
+    with VmbSystem.get_instance() as vmb:
+        cameras = vmb.get_all_cameras()
 
+        if not cameras:
+            print("No cameras found.")
+            return 1
 
-def measure_xt_db(matrix):
-    if matrix is None:
-        return None
-
-    if torch is not None:
-        matrix_t = matrix if torch.is_tensor(matrix) else torch.as_tensor(matrix)
-        p = torch.abs(matrix_t) ** 2
-        max_col, _ = torch.max(p, dim=0)
-        xt = (torch.sum(p, dim=0) - max_col) / torch.clamp(max_col, min=1e-12)
-        return float(10.0 * torch.log10(torch.clamp(torch.mean(xt), min=1e-12)).item())
-
-    matrix_np = np.asarray(matrix)
-    p = np.abs(matrix_np) ** 2
-    max_col = np.max(p, axis=0)
-    xt = (np.sum(p, axis=0) - max_col) / np.maximum(max_col, 1e-12)
-    return float(10.0 * np.log10(max(np.mean(xt), 1e-12)))
-
-
-def get_spatial_moments_torch(modes, threshold_ratio: float = 0.05, power: float = 1.0):
-    _, height, width = modes.shape
-    intensity = torch.abs(modes) ** 2
-    max_intensity = intensity.amax(dim=(-2, -1), keepdim=True)
-
-    intensity = torch.where(
-        intensity > float(threshold_ratio) * max_intensity,
-        intensity,
-        torch.zeros_like(intensity),
-    )
-
-    if float(power) != 1.0:
-        intensity = intensity ** float(power)
-
-    p = intensity / (intensity.sum(dim=(-2, -1), keepdim=True) + 1e-12)
-    y_grid = torch.linspace(-1, 1, height, device=modes.device)
-    x_grid = torch.linspace(-1, 1, width, device=modes.device)
-    yy, xx = torch.meshgrid(y_grid, x_grid, indexing="ij")
-    cx = (p * xx).sum(dim=(-2, -1), keepdim=True)
-    cy = (p * yy).sum(dim=(-2, -1), keepdim=True)
-    var_x = (p * (xx - cx) ** 2).sum(dim=(-2, -1))
-    var_y = (p * (yy - cy) ** 2).sum(dim=(-2, -1))
-    std_x = torch.sqrt(var_x + 1e-12)
-    std_y = torch.sqrt(var_y + 1e-12)
-    return cx.squeeze(-1).squeeze(-1), cy.squeeze(-1).squeeze(-1), std_x, std_y
-
-
-def auto_align_modes_torch(recovered_modes, target_modes):
-
-    n_rec, _, _ = recovered_modes.shape
-    rec_fund = recovered_modes[0:1]
-    tar_fund = target_modes[0:1]
-    r_cx, r_cy, r_std_x, r_std_y = get_spatial_moments_torch(rec_fund)
-    t_cx, t_cy, t_std_x, t_std_y = get_spatial_moments_torch(tar_fund)
-    scale_x = (r_std_x / (t_std_x + 1e-12))[0]
-    scale_y = (r_std_y / (t_std_y + 1e-12))[0]
-    shift_x = r_cx[0] - scale_x * t_cx[0]
-    shift_y = r_cy[0] - scale_y * t_cy[0]
-    theta = torch.zeros((n_rec, 2, 3), device=recovered_modes.device)
-
-    theta[:, 0, 0] = scale_x
-    theta[:, 1, 1] = scale_y
-    theta[:, 0, 2] = shift_x
-    theta[:, 1, 2] = shift_y
-    is_complex = torch.is_complex(recovered_modes)
-
-    if is_complex:
-        modes_formatted = torch.view_as_real(recovered_modes).permute(0, 3, 1, 2)
-
-    else:
-
-        modes_formatted = recovered_modes.unsqueeze(1)
-    grid = F.affine_grid(theta, modes_formatted.size(), align_corners=True)
-
-    aligned = F.grid_sample(
-        modes_formatted,
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )
-
-    if is_complex:
-        return torch.view_as_complex(aligned.permute(0, 2, 3, 1).contiguous())
-
-    return aligned.squeeze(1)
-
+        with cameras[0] as cam:
+            print("Using camera:", cam.get_name())
+            window = LiveCameraWindow(cam)
+            window.show()
+            return app.exec_()
 
 def get_phase_values_from_calibration(
     plm: PLM,
@@ -7433,127 +7291,6 @@ def get_phase_values_from_calibration(
 
         representative_values[1:] = 0.5 * (buckets[:-1] + buckets[1:])
     return phase_levels, buckets, representative_values
-
-
-def principal_phase_diff(value1: complex, value2: complex) -> float:
-    return float(np.angle(value1 * np.conj(value2)))
-    # return float(np.angle(value1) - np.angle(value2))
-
-
-def wrap_phase_to_pi(phase_rad: float) -> float:
-    return float((phase_rad + np.pi) % (2.0 * np.pi) - np.pi)
-
-
-def wrap_phase_to_2pi(phase_rad: float) -> float:
-    return float((phase_rad + 2.0 * np.pi) % (2.0 * np.pi))
-
-
-def wrap_phase_array_to_pi(phase: np.ndarray) -> np.ndarray:
-    return np.asarray((phase + np.pi) % (2.0 * np.pi) - np.pi, dtype=np.float32)
-
-
-def estimate_subpixel_peak_in_roi(
-    magnitude: np.ndarray,
-    roi: tuple[int, int, int, int],
-    eps: float = 1e-12,
-) -> tuple[float, float]:
-
-    x0, y0, x1, y1 = roi
-    patch = np.maximum(magnitude[y0:y1, x0:x1], 0.0)
-    if patch.size == 0:
-
-        return float((y0 + y1) * 0.5), float((x0 + x1) * 0.5)
-    yy, xx = np.indices(patch.shape, dtype=np.float64)
-    weights = patch.astype(np.float64)
-    weight_sum = float(np.sum(weights))
-    if weight_sum <= eps:
-        return float((y0 + y1) * 0.5), float((x0 + x1) * 0.5)
-    py = float(np.sum((yy + y0) * weights) / weight_sum)
-    px = float(np.sum((xx + x0) * weights) / weight_sum)
-    return py, px
-
-
-def demodulate_to_center_no_ref(
-    fft_filtered: np.ndarray,
-    peak_y_f: float,
-    peak_x_f: float,
-) -> np.ndarray:
-
-    height, width = fft_filtered.shape[:2]
-    center_y = (height - 1) / 2.0
-    center_x = (width - 1) / 2.0
-    dy = center_y - float(peak_y_f)
-    dx = center_x - float(peak_x_f)
-    dy_i = int(round(dy))
-    dx_i = int(round(dx))
-    fft_integer_shifted = np.roll(fft_filtered, shift=(dy_i, dx_i), axis=(0, 1))
-    dy_f = dy - dy_i
-    dx_f = dx - dx_i
-    recovered = np.fft.ifft2(np.fft.ifftshift(fft_integer_shifted))
-    yy, xx = np.indices((height, width), dtype=np.float32)
-    frac_ramp = np.exp(-1j * 2.0 * np.pi * ((dx_f * xx / width) + (dy_f * yy / height)))
-    return recovered * frac_ramp
-
-
-def remove_linear_phase_tilt_blind(
-    field: np.ndarray,
-    amp_thresh: float = 0.2,
-    eps: float = 1e-12,
-) -> np.ndarray:
-
-    amp = np.abs(field)
-    amp_max = float(np.max(amp))
-    if amp_max <= eps:
-        return field
-
-    mask = amp > (amp_thresh * amp_max)
-    gx_num = np.sum(np.conj(field[:, :-1]) * field[:, 1:] * mask[:, :-1])
-    gy_num = np.sum(np.conj(field[:-1, :]) * field[1:, :] * mask[:-1, :])
-    gx = np.angle(gx_num) if np.abs(gx_num) > eps else 0.0
-    gy = np.angle(gy_num) if np.abs(gy_num) > eps else 0.0
-    height, width = field.shape[:2]
-    yy, xx = np.indices((height, width), dtype=np.float32)
-    ramp = np.exp(-1j * (gx * xx + gy * yy))
-    return field * ramp
-
-
-def remove_global_phase_offset_blind(
-    field: np.ndarray,
-    amp_thresh: float = 0.2,
-    eps: float = 1e-12,
-) -> np.ndarray:
-
-    amp = np.abs(field)
-    amp_max = float(np.max(amp))
-    if amp_max <= eps:
-        return field
-    mask = amp > (amp_thresh * amp_max)
-    if not np.any(mask):
-        return field
-
-    phase_ref_complex = np.sum(field[mask])
-    if np.abs(phase_ref_complex) <= eps:
-        return field
-
-    phase_ref = np.angle(phase_ref_complex)
-    return field * np.exp(-1j * phase_ref)
-
-
-def main() -> int:
-    app = QApplication(sys.argv)
-
-    with VmbSystem.get_instance() as vmb:
-        cameras = vmb.get_all_cameras()
-
-        if not cameras:
-            print("No cameras found.")
-            return 1
-
-        with cameras[0] as cam:
-            print("Using camera:", cam.get_name())
-            window = LiveCameraWindow(cam)
-            window.show()
-            return app.exec_()
 
 
 if __name__ == "__main__":

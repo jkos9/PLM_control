@@ -1,174 +1,75 @@
-from __future__ import annotations
-
-import math
-from typing import Optional
-
 import numpy as np
+import torch
+from typing import Optional
+import matplotlib as mpl
 
 
-def _to_numpy(array, dtype: Optional[np.dtype] = None) -> np.ndarray:
-	arr = np.asarray(array)
-	if dtype is None:
-		return arr
-	return np.asarray(arr, dtype=dtype)
+def principal_phase_diff(value1: complex, value2: complex) -> float:
+    return float(np.angle(value1 * np.conj(value2)))
+    # return float(np.angle(value1) - np.angle(value2))
 
 
-def compute_fft_shifted_and_magnitude_image(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-	image_np = _to_numpy(image, dtype=np.float32)
-	fft_complex = np.fft.fft2(image_np)
-	fft_shifted = np.fft.fftshift(fft_complex)
-	magnitude_log = np.log1p(np.abs(fft_shifted))
-	min_val = float(np.min(magnitude_log))
-	max_val = float(np.max(magnitude_log))
-	den = max_val - min_val
-	if den <= 0.0:
-		magnitude_uint8 = np.zeros_like(magnitude_log, dtype=np.uint8)
-	else:
-		normalized = (magnitude_log - min_val) / den
-		magnitude_uint8 = np.clip(normalized * 255.0, 0.0, 255.0).astype(np.uint8)
-	return fft_shifted.astype(np.complex64, copy=False), magnitude_uint8
+def wrap_phase_to_pi(phase_rad: float) -> float:
+    return float((phase_rad + np.pi) % (2.0 * np.pi) - np.pi)
 
 
-def estimate_subpixel_peak_in_roi(
-	magnitude: np.ndarray,
-	roi: tuple[int, int, int, int],
-	eps: float = 1e-12,
-) -> tuple[float, float]:
-	magnitude_np = _to_numpy(magnitude, dtype=np.float32)
-	x0, y0, x1, y1 = [int(v) for v in roi]
-	patch = np.clip(magnitude_np[y0:y1, x0:x1], 0.0, None)
-	if patch.size == 0:
-		return float((y0 + y1) * 0.5), float((x0 + x1) * 0.5)
-
-	weights = patch
-	weight_sum = float(np.sum(weights))
-	if weight_sum <= float(eps):
-		return float((y0 + y1) * 0.5), float((x0 + x1) * 0.5)
-
-	y_coords = np.arange(y0, y1, dtype=np.float32).reshape(-1, 1)
-	x_coords = np.arange(x0, x1, dtype=np.float32).reshape(1, -1)
-	py = float(np.sum(y_coords * weights) / weight_sum)
-	px = float(np.sum(x_coords * weights) / weight_sum)
-	return py, px
+def wrap_phase_to_2pi(phase_rad: float) -> float:
+    return float((phase_rad + 2.0 * np.pi) % (2.0 * np.pi))
 
 
-def demodulate_to_center_no_ref(
-	fft_filtered: np.ndarray,
-	peak_y_f: float,
-	peak_x_f: float,
+def wrap_phase_array_to_pi(phase: np.ndarray) -> np.ndarray:
+    return np.asarray((phase + np.pi) % (2.0 * np.pi) - np.pi, dtype=np.float32)
+
+def normalize_modes_np(modes: np.ndarray) -> np.ndarray:
+    norm = np.sqrt(np.sum(np.abs(modes) ** 2, axis=(-2, -1), keepdims=True))
+    norm = np.maximum(norm, 1e-12)
+    return modes / norm
+
+def normalize_modes_torch(modes):
+    norm = torch.sqrt(torch.sum(torch.abs(modes) ** 2, dim=(-2, -1), keepdim=True))
+    norm = torch.clamp(norm, min=1e-12)
+    return modes / norm
+
+
+def measure_xt_db(matrix):
+    if matrix is None:
+        return None
+
+    if torch is not None:
+        matrix_t = matrix if torch.is_tensor(matrix) else torch.as_tensor(matrix)
+        p = torch.abs(matrix_t) ** 2
+        max_col, _ = torch.max(p, dim=0)
+        xt = (torch.sum(p, dim=0) - max_col) / torch.clamp(max_col, min=1e-12)
+        return float(10.0 * torch.log10(torch.clamp(torch.mean(xt), min=1e-12)).item())
+
+    matrix_np = np.asarray(matrix)
+    p = np.abs(matrix_np) ** 2
+    max_col = np.max(p, axis=0)
+    xt = (np.sum(p, axis=0) - max_col) / np.maximum(max_col, 1e-12)
+    return float(10.0 * np.log10(max(np.mean(xt), 1e-12)))
+
+
+def cv_normalize_to_uint8(image: np.ndarray) -> np.ndarray:
+    min_val = float(np.min(image))
+    max_val = float(np.max(image))
+    if max_val <= min_val:
+        return np.zeros_like(image, dtype=np.uint8)
+    normalized = (image - min_val) / (max_val - min_val)
+    return (normalized * 255.0).astype(np.uint8)
+
+
+def phase_to_rgb_uint8(
+    phase: np.ndarray,
+    value: Optional[np.ndarray] = None,
+    cmap_name: str = "viridis",
 ) -> np.ndarray:
-	fft_filtered_np = _to_numpy(fft_filtered)
-	if not np.iscomplexobj(fft_filtered_np):
-		fft_filtered_np = fft_filtered_np.astype(np.complex64)
+    h = np.mod((phase + np.pi) / (2.0 * np.pi), 1.0)
+    rgb = mpl.colormaps[cmap_name](h)[..., :3].astype(np.float32)
 
-	height, width = fft_filtered_np.shape[-2], fft_filtered_np.shape[-1]
-	center_y = (float(height) - 1.0) / 2.0
-	center_x = (float(width) - 1.0) / 2.0
+    if value is not None:
+        v = np.clip(value.astype(np.float32), 0.0, 1.0)
+        rgb *= v[..., None]
 
-	dy = center_y - float(peak_y_f)
-	dx = center_x - float(peak_x_f)
-	dy_i = int(round(dy))
-	dx_i = int(round(dx))
-	fft_integer_shifted = np.roll(fft_filtered_np, shift=(dy_i, dx_i), axis=(-2, -1))
+    return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
 
-	dy_f = float(dy - dy_i)
-	dx_f = float(dx - dx_i)
-	recovered = np.fft.ifft2(np.fft.ifftshift(fft_integer_shifted, axes=(-2, -1)))
-
-	yy = np.arange(height, dtype=np.float32).reshape(-1, 1)
-	xx = np.arange(width, dtype=np.float32).reshape(1, -1)
-	phase = -2.0 * math.pi * ((dx_f * xx / float(width)) + (dy_f * yy / float(height)))
-	frac_ramp = np.exp(1j * phase).astype(np.complex64)
-	return recovered * frac_ramp
-
-
-def remove_linear_phase_tilt_blind(
-	field: np.ndarray,
-	amp_thresh: float = 0.2,
-	eps: float = 1e-12,
-) -> np.ndarray:
-	field_np = _to_numpy(field)
-	if not np.iscomplexobj(field_np):
-		field_np = field_np.astype(np.complex64)
-
-	amp = np.abs(field_np)
-	amp_max = float(np.max(amp))
-	if amp_max <= float(eps):
-		return field_np
-
-	mask = amp > (float(amp_thresh) * amp_max)
-	mask_complex_x = mask[:, :-1].astype(field_np.dtype)
-	mask_complex_y = mask[:-1, :].astype(field_np.dtype)
-	gx_num = np.sum(np.conj(field_np[:, :-1]) * field_np[:, 1:] * mask_complex_x)
-	gy_num = np.sum(np.conj(field_np[:-1, :]) * field_np[1:, :] * mask_complex_y)
-
-	gx = float(np.angle(gx_num)) if float(np.abs(gx_num)) > float(eps) else 0.0
-	gy = float(np.angle(gy_num)) if float(np.abs(gy_num)) > float(eps) else 0.0
-
-	height, width = field_np.shape[-2], field_np.shape[-1]
-	yy = np.arange(height, dtype=np.float32).reshape(-1, 1)
-	xx = np.arange(width, dtype=np.float32).reshape(1, -1)
-	ramp = np.exp(-1j * (gx * xx + gy * yy)).astype(np.complex64)
-	return field_np * ramp
-
-
-def remove_global_phase_offset_blind(
-	field: np.ndarray,
-	amp_thresh: float = 0.2,
-	eps: float = 1e-12,
-) -> np.ndarray:
-	field_np = _to_numpy(field)
-	if not np.iscomplexobj(field_np):
-		field_np = field_np.astype(np.complex64)
-
-	amp = np.abs(field_np)
-	amp_max = float(np.max(amp))
-	if amp_max <= float(eps):
-		return field_np
-
-	mask = amp > (float(amp_thresh) * amp_max)
-	if not np.any(mask):
-		return field_np
-
-	phase_ref_complex = np.sum(field_np[mask])
-	if float(np.abs(phase_ref_complex)) <= float(eps):
-		return field_np
-	phase_ref = float(np.angle(phase_ref_complex))
-	return field_np * np.exp(-1j * phase_ref).astype(np.complex64)
-
-
-def recover_off_axis_field(
-	fft_shifted: np.ndarray,
-	roi: tuple[int, int, int, int],
-	basic_mode: bool = False,
-	amp_thresh: float = 0.2,
-	eps: float = 1e-12,
-) -> Optional[np.ndarray]:
-	fft_shifted_np = _to_numpy(fft_shifted)
-	if not np.iscomplexobj(fft_shifted_np):
-		fft_shifted_np = fft_shifted_np.astype(np.complex64)
-
-	x0, y0, x1, y1 = [int(v) for v in roi]
-	if x1 - x0 < 3 or y1 - y0 < 3:
-		return None
-
-	filtered = np.zeros_like(fft_shifted_np)
-	filtered[y0:y1, x0:x1] = fft_shifted_np[y0:y1, x0:x1]
-
-	if bool(basic_mode):
-		height, width = fft_shifted_np.shape[-2], fft_shifted_np.shape[-1]
-		roi_center_x = (x0 + x1) // 2
-		roi_center_y = (y0 + y1) // 2
-		target_center_x = width // 2
-		target_center_y = height // 2
-		shift_x = int(target_center_x - roi_center_x)
-		shift_y = int(target_center_y - roi_center_y)
-		centered = np.roll(filtered, shift=(shift_y, shift_x), axis=(-2, -1))
-		return np.fft.ifft2(np.fft.ifftshift(centered, axes=(-2, -1)))
-
-	peak_y_f, peak_x_f = estimate_subpixel_peak_in_roi(np.abs(fft_shifted_np), (x0, y0, x1, y1), eps=eps)
-	recovered_field = demodulate_to_center_no_ref(filtered, peak_y_f, peak_x_f)
-	recovered_field = remove_linear_phase_tilt_blind(recovered_field, amp_thresh=amp_thresh, eps=eps)
-	recovered_field = remove_global_phase_offset_blind(recovered_field, amp_thresh=amp_thresh, eps=eps)
-	return recovered_field
 
