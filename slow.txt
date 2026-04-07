@@ -1,0 +1,28 @@
+Per-frame preview signal that triggers full Matplotlib redraw on UI thread
+fixed_plm_control_code_hi_gpu.py:7136 emits plm_phase_preview_updated every frame.
+That lands in fixed_plm_control_code_hi_gpu.py:6185, which calls fixed_plm_control_code_hi_gpu.py:6132.
+That plot function rebuilds figure, axes, colorbar, tight_layout, and draw_idle every update. This alone can create lag and queue buildup (desync feeling).
+
+PLM conversion and display upload each frame
+fixed_plm_control_code_hi_gpu.py:7148 plm.process_phase_map
+fixed_plm_control_code_hi_gpu.py:7150 Image.fromarray
+fixed_plm_control_code_hi_gpu.py:7152 win.clear
+fixed_plm_control_code_hi_gpu.py:7154 win.load
+This is the core heavy path and has to complete before next interval.
+
+Full-frame quantization every frame
+fixed_plm_control_code_hi_gpu.py:7140 np.digitize on full 2D phase map, then clip/indexing.
+At higher rates this becomes expensive memory bandwidth work.
+
+Hidden full-frame correction remap every frame
+fixed_plm_control_code_hi_gpu.py:7102 calls active correction each frame.
+Inside fixed_plm_control_code_hi_gpu.py:6734, it does wrap/mod/nan_to_num across the whole frame at fixed_plm_control_code_hi_gpu.py:6766, fixed_plm_control_code_hi_gpu.py:6771, fixed_plm_control_code_hi_gpu.py:6776.
+If correction map is static, this repeated normalization is wasted cost.
+
+Full-frame overlay composition and extra allocations
+fixed_plm_control_code_hi_gpu.py:7069 and below compose base + grating + zernike + correction per frame.
+Dynamic PSI branch creates new zero arrays each frame; static branch still does large array math.
+
+Timing drift behavior under overload
+fixed_plm_control_code_hi_gpu.py:7160 sets last_update = now (not fixed-step accumulation).
+If one iteration overruns, subsequent frames slide, causing jitter and apparent desync with camera-side processing.

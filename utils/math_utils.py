@@ -90,3 +90,46 @@ def phase_to_rgb_uint8(
     return rgb
 
 
+_CMAP_LUTS_TORCH = {}
+
+def phase_to_rgb_uint8_torch(
+    phase: torch.Tensor,
+    value: Optional[torch.Tensor] = None,
+    cmap_name: str = "viridis",
+) -> torch.Tensor:
+    
+    device = phase.device
+    lut_key = (cmap_name, device)
+    
+    # 1. Fetch or build the LUT once per colormap/device combination
+    if lut_key not in _CMAP_LUTS_TORCH:
+        # We still use matplotlib/numpy to generate the raw color data
+        cmap = mpl.colormaps[cmap_name]
+        lut_np = cmap(np.linspace(0, 1, 256))[:, :3] * 255.0
+        
+        # Convert to a PyTorch tensor and push it to the correct device immediately
+        _CMAP_LUTS_TORCH[lut_key] = torch.from_numpy(lut_np).to(
+            dtype=torch.uint8, device=device
+        )
+        
+    lut = _CMAP_LUTS_TORCH[lut_key]
+    
+    # 2. Fast mapping: Normalize phase to 0-255 integer indices
+    # (phase + pi) / 2pi -> mapped to 0-255
+    phase_norm_float = (phase + torch.pi) / (2.0 * torch.pi) * 255.0
+    
+    # PyTorch requires indices to be long (int64) for array indexing
+    phase_norm = torch.clamp(phase_norm_float, min=0.0, max=255.0).to(torch.long)
+    
+    # 3. Fast indexing
+    rgb = lut[phase_norm]
+    
+    # 4. Apply amplitude weighting
+    if value is not None:
+        v = torch.clamp(value.to(torch.float32), min=0.0, max=1.0)
+        
+        # .unsqueeze(-1) replaces NumPy's [..., None] for broadcasting
+        rgb = (rgb.to(torch.float32) * v.unsqueeze(-1)).to(torch.uint8)
+        
+    return rgb
+

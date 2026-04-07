@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import time
 
+
 def benchmark_fft(shape=(1024, 1024), iterations=100):
     print(f"Benchmarking 2D FFT + Shift + Magnitude on shape {shape}")
     print(f"Iterations: {iterations}\n")

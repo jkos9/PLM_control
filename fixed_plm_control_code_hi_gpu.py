@@ -221,30 +221,28 @@ class FrameProcessorThread(QtCore.QThread):
                             # Pull the final recovered field back to CPU
                             recovered_field = recovered_field_t.detach().cpu().numpy()
                         else:
-                            #peak_y_f, peak_x_f = estimate_subpixel_peak_in_roi(np.abs(fft_shifted), fft_roi)
-                            #recovered_field = demodulate_to_center_no_ref(filtered, peak_y_f, peak_x_f)
-                            #recovered_field = remove_linear_phase_tilt_blind(recovered_field)
-                            #recovered_field = remove_global_phase_offset_blind(recovered_field)
-                            
-                            # Advanced recovery relies on your external numpy utility functions.
-                            # We must pull the shifted FFT back to CPU to use them.
 
                             peak_y_f, peak_x_f = estimate_subpixel_peak_in_roi_torch(torch.abs(fft_shifted), fft_roi)
                             recovered_field = demodulate_to_center_no_ref_torch(filtered, peak_y_f, peak_x_f)
                             recovered_field = remove_linear_phase_tilt_blind_torch(recovered_field)
                             recovered_field = remove_global_phase_offset_blind_torch(recovered_field)    
                             
-                            recovered_field = recovered_field.detach().cpu().numpy()
+                            #recovered_field = recovered_field.detach().cpu().numpy()
 
 
                         # Generate the RGB colormap representation entirely in the background thread
                         if recovered_field is not None:
-                            amplitude = np.abs(recovered_field)
-                            amplitude_norm = amplitude / (float(np.max(amplitude)) + 1e-12)
-                            recovered_phase = np.angle(recovered_field)
-                            phase_rgb = phase_to_rgb_uint8(
+                            amplitude = torch.abs(recovered_field)
+                            amplitude_norm = amplitude / (float(torch.max(amplitude)) + 1e-12)
+                            recovered_phase = torch.angle(recovered_field)
+                            phase_rgb = phase_to_rgb_uint8_torch(
                                 recovered_phase, value=amplitude_norm, cmap_name=cmap_name
                             )
+
+                            recovered_field = recovered_field.detach().cpu().numpy()
+                            phase_rgb = phase_rgb.detach().cpu().numpy()
+                            recovered_phase = recovered_phase.detach().cpu().numpy()
+
 
                 # 7. Ship it back to the main thread in a stamped dictionary
                 payload = {
@@ -4685,6 +4683,17 @@ class LiveCameraWindow(QMainWindow):
                 self._latest_frame = image
                 self._frame_count += 1
                 
+                # Check if the liquid crystals are still settling
+                # Only stamp the frame if we have surpassed the drop count!
+                drop_target = self._drop_frames_start_count + getattr(self, '_drop_frames_remaining', 0)
+                
+                if self._frame_count > drop_target:
+                    active_seq = self._active_pattern_upload_sequence
+                    active_idx = self._current_plm_pattern_index
+                else:
+                    active_seq = -1  # Transient frame, ignore for gallery
+                    active_idx = -1
+                
             # Push the latest state to the worker thread safely
             self.processor_thread.update_state(
                 frame=image,
@@ -4694,11 +4703,43 @@ class LiveCameraWindow(QMainWindow):
                 live_roi=self._live_roi,
                 basic_recovery=self.basic_recovery_radio.isChecked(),
                 colormap_name=self._phase_colormap_name,
-                pattern_seq=self._active_pattern_upload_sequence, # NEW
-                pattern_idx=self._current_plm_pattern_index       # NEW
+                pattern_seq=active_seq, # Stamped ONLY if stable
+                pattern_idx=active_idx  # Stamped ONLY if stable
             )
         finally:
             cam.queue_frame(frame)
+
+
+    def _store_pattern_field_direct(self, recovered_field: np.ndarray, pattern_idx: int) -> None:
+        self._pattern_fields_by_pattern[int(pattern_idx)] = np.asarray(
+            recovered_field, dtype=np.complex64
+        ).copy()
+
+    def _store_recovered_mode_direct(self, recovered_field: np.ndarray, pattern_idx: int) -> None:
+        mode = self._prepare_mode_for_target_shape(recovered_field)
+        self._recovered_modes_by_pattern[int(pattern_idx)] = mode
+        self._recompute_channel_matrix()
+        self._channel_matrix_dirty = True
+
+    def _capture_pattern_preview_direct(self, phase_rgb: np.ndarray, pattern_idx: int) -> None:
+        if pattern_idx not in self._pattern_preview_labels:
+            return
+        
+        height, width = int(phase_rgb.shape[0]), int(phase_rgb.shape[1])
+        contiguous = np.ascontiguousarray(phase_rgb)
+        image = QImage(contiguous.data, width, height, width * 3, QImage.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(image)
+        
+        label = self._pattern_preview_labels[pattern_idx]
+        scaled = pixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
+        
+        self._pattern_preview_pixmaps[pattern_idx] = scaled
+        label.setPixmap(scaled)
+        label.setText("")
+        
+        self.pattern_gallery_status_label.setText(
+            f"Updated gallery for pattern {pattern_idx}/{len(self._pattern_preview_labels)}"
+        )
 
 
     def _on_auto_exposure_toggled(self, checked: bool) -> None:
@@ -7206,6 +7247,7 @@ class LiveCameraWindow(QMainWindow):
         roi_sum = payload["roi_sum"]
         roi_mean = payload["roi_mean"]
         pattern_seq = payload["pattern_seq"] # This guarantees sync!
+        pattern_idx = payload["pattern_idx"] # This guarantees sync!
         
         self._last_processed_frame_count = frame_count
 
@@ -7218,17 +7260,21 @@ class LiveCameraWindow(QMainWindow):
             self._append_live_intensity_sample(roi_sum)
 
         if recovered_field is not None and phase_rgb is not None:
-            # Overwrite the class sequences with the stamped sequence just for storage
-            # This is the magic that fixes the gallery mismatch!
-            original_seq = self._pattern_upload_sequence
-            self._pattern_upload_sequence = pattern_seq 
-            
-            self._store_pattern_field_if_ready(recovered_field)
-            self._store_recovered_mode_if_ready(recovered_field)
-            self._capture_pattern_preview_if_ready(phase_rgb)
-            
-            # Restore sequence
-            self._pattern_upload_sequence = original_seq
+            # Check if this is a stable frame tied to a valid pattern
+            if pattern_idx is not None and pattern_idx > 0 and pattern_seq > 0:
+                
+                # Initialize sequence tracker if it doesn't exist
+                if not hasattr(self, "_last_captured_gallery_seq"):
+                    self._last_captured_gallery_seq = -1
+                
+                # ONLY capture if we haven't already captured this exact PLM sequence!
+                if pattern_seq > self._last_captured_gallery_seq:
+                    self._last_captured_gallery_seq = pattern_seq
+                    
+                    # Force the capture functions to use the STAMPED index!
+                    self._store_pattern_field_direct(recovered_field, pattern_idx)
+                    self._store_recovered_mode_direct(recovered_field, pattern_idx)
+                    self._capture_pattern_preview_direct(phase_rgb, pattern_idx)
             
             self._maybe_step_continuous_zernike_optimizer()
             self._maybe_log_current_measurement(frame_count)
@@ -7267,50 +7313,6 @@ class LiveCameraWindow(QMainWindow):
             
             self._set_status(f"Live view started. Frames received: {frame_count}")
 
-    '''
-    def _compute_fft_shifted_and_magnitude_image(
-        self, image: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-
-        float_image = image.astype(np.float32)
-        fft_complex = np.fft.fft2(float_image)
-        fft_shifted = np.fft.fftshift(fft_complex)
-        magnitude = np.abs(fft_shifted)
-        magnitude_log = np.log1p(magnitude)
-
-        magnitude_norm = cv_normalize_to_uint8(magnitude_log)
-        return fft_shifted, magnitude_norm
-
-
-    def _recover_off_axis_field(self, fft_shifted: np.ndarray) -> Optional[np.ndarray]:
-        roi = self._fft_roi
-        if roi is None:
-            return None
-        x0, y0, x1, y1 = roi
-
-        if x1 - x0 < 3 or y1 - y0 < 3:
-            return None
-
-        filtered = np.zeros_like(fft_shifted)
-        filtered[y0:y1, x0:x1] = fft_shifted[y0:y1, x0:x1]
-        if self.basic_recovery_radio.isChecked():
-
-            height, width = fft_shifted.shape[:2]
-            roi_center_x = (x0 + x1) // 2
-            roi_center_y = (y0 + y1) // 2
-            target_center_x = width // 2
-            target_center_y = height // 2
-            shift_x = target_center_x - roi_center_x
-            shift_y = target_center_y - roi_center_y
-            centered = np.roll(filtered, shift=(shift_y, shift_x), axis=(0, 1))
-            return np.fft.ifft2(np.fft.ifftshift(centered))
-
-        peak_y_f, peak_x_f = estimate_subpixel_peak_in_roi(np.abs(fft_shifted), roi)
-        recovered_field = demodulate_to_center_no_ref(filtered, peak_y_f, peak_x_f)
-        recovered_field = remove_linear_phase_tilt_blind(recovered_field)
-        recovered_field = remove_global_phase_offset_blind(recovered_field)
-        return recovered_field
-    '''
 
     def closeEvent(self, event):
         # self.timer.stop()
@@ -7367,6 +7369,10 @@ def get_phase_values_from_calibration(
 
         representative_values[1:] = 0.5 * (buckets[:-1] + buckets[1:])
     return phase_levels, buckets, representative_values
+
+
+
+
 
 
 if __name__ == "__main__":
