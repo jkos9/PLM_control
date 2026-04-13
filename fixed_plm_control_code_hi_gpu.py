@@ -17,14 +17,6 @@ from PIL import Image
 #from pygame import image
 from vmbpy import PixelFormat, VmbSystem
 
-try:
-    from scipy import optimize
-    from scipy.ndimage import center_of_mass
-
-except Exception:
-    optimize = None
-    center_of_mass = None
-
 from utils.math_utils import *
 from utils.field_utils import *
 #from utils.plm_utils import *
@@ -178,19 +170,18 @@ class FrameProcessorThread(QtCore.QThread):
                         self._dark_frame_gpu = torch.from_numpy(dark_frame).to(self.device, dtype=torch.float32)
                         self._last_dark_frame_ref = dark_frame
                     
-                    image_t = torch.clamp(image_t - self._dark_frame_gpu, 0.0, 65535.0)
-
-                image_corrected_np = image_t.detach().cpu().numpy().astype(np.float32, copy=False)
-
-                # Keep the live display in 8-bit while retaining high-dynamic data for MFD fits.
-                image = cv_normalize_to_uint8(image_corrected_np)
+                    image_t = torch.clamp(image_t - self._dark_frame_gpu, 0.0, 255.0)
+                
+                # We need a CPU uint8 copy for ROI intensity math and final payload
+                image_corrected_np = image_t.detach().cpu().to(torch.uint8).numpy()
+                image = image_corrected_np
                 
                 # 4. Calculate Live ROI Intensity
                 roi_sum = None
                 roi_mean = None
                 if live_roi is not None:
                     x0, y0, x1, y1 = live_roi
-                    roi_patch = image_corrected_np[y0:y1, x0:x1]
+                    roi_patch = image_np[y0:y1, x0:x1]
                     if roi_patch.size > 0:
                         roi_sum = float(np.sum(roi_patch, dtype=np.float64))
                         roi_mean = float(np.mean(roi_patch))
@@ -262,8 +253,6 @@ class FrameProcessorThread(QtCore.QThread):
                     "phase_rgb": phase_rgb,
                     "roi_sum": roi_sum,
                     "roi_mean": roi_mean,
-                    "image_for_mfd": image_corrected_np,
-                    "raw_image_for_clip": image_np,
                     "pattern_seq": thread_seq, # Stamped Sequence
                     "pattern_idx": thread_idx  # Stamped Index
                 }
@@ -311,22 +300,6 @@ class RoiSelectableImageLabel(QLabel):
             int(image.shape[0]),
             int(image.shape[1]),
             QImage.Format_Grayscale8,
-        ).copy()
-
-        self._refresh_display()
-
-    def set_image_rgb_array(self, image: np.ndarray) -> None:
-
-        self._image_shape = (int(image.shape[0]), int(image.shape[1]))
-
-        contiguous = np.ascontiguousarray(image)
-
-        self._display_qimage = QImage(
-            contiguous.data,
-            int(image.shape[1]),
-            int(image.shape[0]),
-            int(image.shape[1]) * 3,
-            QImage.Format_RGB888,
         ).copy()
 
         self._refresh_display()
@@ -867,8 +840,6 @@ class LiveCameraWindow(QMainWindow):
         self.live_roi_intensity_label = QLabel("Live ROI sum intensity: n/a")
         self.gaussian_mfd_checkbox = QCheckBox("Measure Gaussian MFD")
         self.gaussian_mfd_label = QLabel("Gaussian MFD (pixel pitch 15 um): disabled")
-        self.clipping_overlay_checkbox = QCheckBox("Show clipping overlay")
-        self.clipping_overlay_label = QLabel("Clipping: disabled")
         self.grating_x_edit = QLineEdit("0")
         self.grating_x_edit.setMaximumWidth(100)
         self.grating_x_edit.setValidator(QIntValidator(-100000, 100000, self))
@@ -904,6 +875,9 @@ class LiveCameraWindow(QMainWindow):
         self.zernike_opt_perturb_spin.setRange(0.0001, 10.0)
         self.zernike_opt_perturb_spin.setSingleStep(0.01)
         self.zernike_opt_perturb_spin.setValue(0.05)
+        self.zernike_opt_algorithm_combo = QComboBox()
+        self.zernike_opt_algorithm_combo.addItem("ASPGD", "aspgd")
+        self.zernike_opt_algorithm_combo.addItem("Nelder-Mead", "nelder_mead")
         self.zernike_opt_start_button = QPushButton("Start Optimizer")
         self.zernike_opt_stop_button = QPushButton("Stop Optimizer")
         self.zernike_opt_stop_button.setEnabled(False)
@@ -1085,14 +1059,6 @@ class LiveCameraWindow(QMainWindow):
         gaussian_row.addWidget(self.gaussian_mfd_label, 1)
 
         live_panel.addLayout(gaussian_row)
-
-        clipping_row = QHBoxLayout()
-
-        clipping_row.addWidget(self.clipping_overlay_checkbox)
-
-        clipping_row.addWidget(self.clipping_overlay_label, 1)
-
-        live_panel.addLayout(clipping_row)
 
         grating_x_row = QHBoxLayout()
 
@@ -1451,6 +1417,12 @@ class LiveCameraWindow(QMainWindow):
         zernike_opt_row.addWidget(QLabel("Perturbation c0 (rad):"))
 
         zernike_opt_row.addWidget(self.zernike_opt_perturb_spin)
+
+        zernike_opt_row.addSpacing(12)
+
+        zernike_opt_row.addWidget(QLabel("Algorithm:"))
+
+        zernike_opt_row.addWidget(self.zernike_opt_algorithm_combo)
 
         zernike_opt_row.addSpacing(12)
 
@@ -2139,6 +2111,8 @@ class LiveCameraWindow(QMainWindow):
 
         self._channel_matrix_xt_history_db: list[float] = []
 
+        self._zernike_optimizer_algorithm = "aspgd"
+
         self._completed_pattern_loops = 0
 
         self._last_plm_counter_index: Optional[int] = None
@@ -2148,12 +2122,6 @@ class LiveCameraWindow(QMainWindow):
         self._gaussian_pixel_pitch_um = 15.0
 
         self._gaussian_mfd_enabled = False
-
-        self._gaussian_mfd_frame_buffer: deque[np.ndarray] = deque(maxlen=4)
-
-        self._clipping_overlay_enabled = False
-
-        self._clipping_overlay_threshold_dn = 16383
 
         self._phase_plot_dirty = False
 
@@ -2212,8 +2180,6 @@ class LiveCameraWindow(QMainWindow):
         self.grating_y_edit.editingFinished.connect(self._on_grating_input_changed)
 
         self.gaussian_mfd_checkbox.toggled.connect(self._on_gaussian_mfd_toggled)
-
-        self.clipping_overlay_checkbox.toggled.connect(self._on_clipping_overlay_toggled)
 
         self.zernike_reset_button.clicked.connect(self._reset_zernike_coefficients)
 
@@ -2688,6 +2654,20 @@ class LiveCameraWindow(QMainWindow):
 
         return coeff_dict
 
+    def _evaluate_zernike_optimizer_candidate(
+        self,
+        enabled_terms: list[tuple[int, int]],
+        coeff_vector: np.ndarray,
+        last_loop: int,
+        timeout_s: float = 120.0,
+    ) -> Optional[tuple[int, float]]:
+
+        self.zernike_coefficients_apply_requested.emit(
+            self._coeff_vector_to_dict(enabled_terms, coeff_vector)
+        )
+
+        return self._wait_for_next_loop_xt_metric(last_loop, timeout_s=timeout_s)
+
     def _start_zernike_optimizer(self) -> None:
 
         if (
@@ -2721,6 +2701,18 @@ class LiveCameraWindow(QMainWindow):
 
         max_degree = self._get_selected_zernike_max_degree()
 
+        optimizer_algorithm = str(
+            self.zernike_opt_algorithm_combo.currentData()
+            or self._zernike_optimizer_algorithm
+            or "aspgd"
+        )
+
+        if optimizer_algorithm not in ("aspgd", "nelder_mead"):
+
+            optimizer_algorithm = "aspgd"
+
+        self._zernike_optimizer_algorithm = optimizer_algorithm
+
         results_path = self.zernike_opt_results_path_edit.text().strip()
 
         history_path = self.zernike_opt_history_path_edit.text().strip()
@@ -2733,7 +2725,9 @@ class LiveCameraWindow(QMainWindow):
 
         self.zernike_opt_stop_button.setEnabled(True)
 
-        self._set_zernike_optimizer_status("Optimizer: running")
+        self._set_zernike_optimizer_status(
+            f"Optimizer: running ({optimizer_algorithm})"
+        )
 
         self._zernike_optimizer_thread = threading.Thread(
             target=self._run_zernike_optimizer,
@@ -2744,6 +2738,7 @@ class LiveCameraWindow(QMainWindow):
                 learning_rate,
                 perturbation,
                 max_degree,
+                optimizer_algorithm,
                 results_path,
                 history_path,
             ),
@@ -2785,6 +2780,7 @@ class LiveCameraWindow(QMainWindow):
         learning_rate: float,
         perturbation: float,
         max_degree: int,
+        optimizer_algorithm: str,
         results_path: str,
         history_path: str,
     ) -> None:
@@ -2805,6 +2801,12 @@ class LiveCameraWindow(QMainWindow):
 
             history_file_path.parent.mkdir(parents=True, exist_ok=True)
 
+            optimizer_algorithm = str(optimizer_algorithm or "aspgd")
+
+            if optimizer_algorithm not in ("aspgd", "nelder_mead"):
+
+                optimizer_algorithm = "aspgd"
+
             local_rng = np.random.default_rng()
 
             term_columns = [f"Z({n},{m})" for (n, m) in enabled_terms]
@@ -2821,6 +2823,7 @@ class LiveCameraWindow(QMainWindow):
                 "learning_rate_ak",
                 "perturbation_ck",
                 "gradient_norm",
+                "optimizer_algorithm",
             ] + term_columns
 
             theta = np.array(
@@ -2844,24 +2847,66 @@ class LiveCameraWindow(QMainWindow):
 
             best_theta = np.array(theta, copy=True)
 
+            best_xt_db: Optional[float] = None
+
             with history_file_path.open("w", newline="", encoding="utf-8") as csv_fp:
 
                 writer = csv.DictWriter(csv_fp, fieldnames=csv_columns)
 
                 writer.writeheader()
 
+                def _write_row(
+                    iteration_idx: int,
+                    phase_label: str,
+                    loop_idx: int,
+                    xt_value: float,
+                    best_xt_value: float,
+                    xt_plus_value: Optional[float],
+                    xt_minus_value: Optional[float],
+                    ak_value: float,
+                    ck_value: float,
+                    grad_norm_value: float,
+                    coeff_vector_value: np.ndarray,
+                ) -> None:
+
+                    row: dict[str, object] = {
+                        "timestamp_iso": datetime.now().isoformat(),
+                        "iteration": int(iteration_idx),
+                        "phase": str(phase_label),
+                        "loop_index": int(loop_idx),
+                        "xt_db": float(xt_value),
+                        "best_xt_db": float(best_xt_value),
+                        "xt_plus_db": None
+                        if xt_plus_value is None
+                        else float(xt_plus_value),
+                        "xt_minus_db": None
+                        if xt_minus_value is None
+                        else float(xt_minus_value),
+                        "learning_rate_ak": float(ak_value),
+                        "perturbation_ck": float(ck_value),
+                        "gradient_norm": float(grad_norm_value),
+                        "optimizer_algorithm": str(optimizer_algorithm),
+                    }
+
+                    for idx, column in enumerate(term_columns):
+
+                        row[column] = float(coeff_vector_value[idx])
+
+                    writer.writerow(row)
+
+                    csv_fp.flush()
+
                 last_loop = int(self._completed_pattern_loops)
 
                 self.zernike_optimizer_status_updated.emit(
-                    "Optimizer: baseline evaluation"
+                    f"Optimizer: baseline evaluation ({optimizer_algorithm})"
                 )
 
-                self.zernike_coefficients_apply_requested.emit(
-                    self._coeff_vector_to_dict(enabled_terms, theta)
-                )
-
-                baseline_metric = self._wait_for_next_loop_xt_metric(
-                    last_loop, timeout_s=120.0
+                baseline_metric = self._evaluate_zernike_optimizer_candidate(
+                    enabled_terms,
+                    theta,
+                    last_loop,
+                    timeout_s=120.0,
                 )
 
                 if baseline_metric is None:
@@ -2876,156 +2921,450 @@ class LiveCameraWindow(QMainWindow):
 
                 best_xt_db = float(baseline_xt_db)
 
-                baseline_row: dict[str, object] = {
-                    "timestamp_iso": datetime.now().isoformat(),
-                    "iteration": 0,
-                    "phase": "baseline",
-                    "loop_index": int(last_loop),
-                    "xt_db": float(baseline_xt_db),
-                    "best_xt_db": float(best_xt_db),
-                    "xt_plus_db": None,
-                    "xt_minus_db": None,
-                    "learning_rate_ak": 0.0,
-                    "perturbation_ck": 0.0,
-                    "gradient_norm": 0.0,
-                }
+                _write_row(
+                    0,
+                    "baseline",
+                    int(last_loop),
+                    float(baseline_xt_db),
+                    float(best_xt_db),
+                    None,
+                    None,
+                    0.0,
+                    0.0,
+                    0.0,
+                    theta,
+                )
 
-                for idx, column in enumerate(term_columns):
+                if optimizer_algorithm == "nelder_mead":
 
-                    baseline_row[column] = float(theta[idx])
+                    n_dims = int(theta.shape[0])
 
-                writer.writerow(baseline_row)
+                    simplex = np.tile(theta[None, :], (n_dims + 1, 1)).astype(
+                        np.float64, copy=False
+                    )
 
-                csv_fp.flush()
+                    nm_step = max(1e-5, float(c0))
 
-                for it in range(1, int(iterations) + 1):
+                    for dim in range(n_dims):
 
-                    if self._zernike_optimizer_stop_event.is_set():
-
-                        self.zernike_optimizer_finished.emit(
-                            False, "Optimizer stopped by user"
+                        simplex[dim + 1, dim] = float(
+                            np.clip(simplex[dim + 1, dim] + nm_step, -20.0, 20.0)
                         )
 
-                        return
+                    values = np.full(n_dims + 1, np.inf, dtype=np.float64)
 
-                    ak = a0 / math.pow(float(it) + 9.0, 0.602)
+                    values[0] = float(baseline_xt_db)
 
-                    ck = c0 / math.pow(float(it), 0.101)
+                    for vertex_idx in range(1, n_dims + 1):
 
-                    delta = local_rng.choice([-1.0, 1.0], size=theta.shape[0])
-
-                    theta_plus = np.clip(theta + ck * delta, -20.0, 20.0)
-
-                    self.zernike_coefficients_apply_requested.emit(
-                        self._coeff_vector_to_dict(enabled_terms, theta_plus)
-                    )
-
-                    metric_plus = self._wait_for_next_loop_xt_metric(
-                        last_loop, timeout_s=120.0
-                    )
-
-                    if metric_plus is None:
-
-                        self.zernike_optimizer_finished.emit(
-                            False, "Optimizer stopped: timed out waiting for XT(+)"
+                        metric_vertex = self._evaluate_zernike_optimizer_candidate(
+                            enabled_terms,
+                            simplex[vertex_idx],
+                            last_loop,
+                            timeout_s=120.0,
                         )
 
-                        return
+                        if metric_vertex is None:
 
-                    last_loop, xt_plus_db = metric_plus
+                            self.zernike_optimizer_finished.emit(
+                                False,
+                                "Optimizer stopped: timed out initializing Nelder-Mead simplex",
+                            )
 
-                    theta_minus = np.clip(theta - ck * delta, -20.0, 20.0)
+                            return
 
-                    self.zernike_coefficients_apply_requested.emit(
-                        self._coeff_vector_to_dict(enabled_terms, theta_minus)
-                    )
+                        last_loop, vertex_xt_db = metric_vertex
 
-                    metric_minus = self._wait_for_next_loop_xt_metric(
-                        last_loop, timeout_s=120.0
-                    )
+                        values[vertex_idx] = float(vertex_xt_db)
 
-                    if metric_minus is None:
+                    order = np.argsort(values)
 
-                        self.zernike_optimizer_finished.emit(
-                            False, "Optimizer stopped: timed out waiting for XT(-)"
+                    simplex = simplex[order]
+
+                    values = values[order]
+
+                    best_xt_db = float(values[0])
+
+                    best_theta = np.array(simplex[0], copy=True)
+
+                    alpha = 1.0
+
+                    gamma = 2.0
+
+                    rho = 0.5
+
+                    sigma = 0.5
+
+                    for it in range(1, int(iterations) + 1):
+
+                        if self._zernike_optimizer_stop_event.is_set():
+
+                            self.zernike_optimizer_finished.emit(
+                                False, "Optimizer stopped by user"
+                            )
+
+                            return
+
+                        order = np.argsort(values)
+
+                        simplex = simplex[order]
+
+                        values = values[order]
+
+                        centroid = np.mean(simplex[:-1], axis=0)
+
+                        worst = simplex[-1]
+
+                        worst_value = float(values[-1])
+
+                        second_worst_value = float(values[-2])
+
+                        best_value = float(values[0])
+
+                        phase_label = "reflect"
+
+                        xr = np.clip(centroid + alpha * (centroid - worst), -20.0, 20.0)
+
+                        metric_reflect = self._evaluate_zernike_optimizer_candidate(
+                            enabled_terms,
+                            xr,
+                            last_loop,
+                            timeout_s=120.0,
                         )
 
-                        return
+                        if metric_reflect is None:
 
-                    last_loop, xt_minus_db = metric_minus
+                            self.zernike_optimizer_finished.emit(
+                                False,
+                                "Optimizer stopped: timed out evaluating Nelder-Mead reflection",
+                            )
 
-                    grad_scale = (float(xt_plus_db) - float(xt_minus_db)) / (
-                        2.0 * max(1e-8, float(ck))
-                    )
+                            return
 
-                    grad = grad_scale * delta
+                        last_loop, fr = metric_reflect
 
-                    m = beta1 * m + (1.0 - beta1) * grad
+                        if float(fr) < best_value:
 
-                    v = beta2 * v + (1.0 - beta2) * (grad * grad)
+                            xe = np.clip(
+                                centroid + gamma * (xr - centroid), -20.0, 20.0
+                            )
 
-                    m_hat = m / (1.0 - math.pow(beta1, float(it)))
+                            metric_expand = self._evaluate_zernike_optimizer_candidate(
+                                enabled_terms,
+                                xe,
+                                last_loop,
+                                timeout_s=120.0,
+                            )
 
-                    v_hat = v / (1.0 - math.pow(beta2, float(it)))
+                            if metric_expand is None:
 
-                    theta = np.clip(
-                        theta - float(ak) * (m_hat / (np.sqrt(v_hat) + eps)),
-                        -20.0,
-                        20.0,
-                    )
+                                self.zernike_optimizer_finished.emit(
+                                    False,
+                                    "Optimizer stopped: timed out evaluating Nelder-Mead expansion",
+                                )
 
-                    self.zernike_coefficients_apply_requested.emit(
-                        self._coeff_vector_to_dict(enabled_terms, theta)
-                    )
+                                return
 
-                    metric_current = self._wait_for_next_loop_xt_metric(
-                        last_loop, timeout_s=120.0
-                    )
+                            last_loop, fe = metric_expand
 
-                    if metric_current is None:
+                            if float(fe) < float(fr):
 
-                        self.zernike_optimizer_finished.emit(
-                            False,
-                            "Optimizer stopped: timed out waiting for XT(updated)",
+                                simplex[-1] = xe
+
+                                values[-1] = float(fe)
+
+                                phase_label = "expand"
+
+                            else:
+
+                                simplex[-1] = xr
+
+                                values[-1] = float(fr)
+
+                                phase_label = "reflect-best"
+
+                        elif float(fr) < second_worst_value:
+
+                            simplex[-1] = xr
+
+                            values[-1] = float(fr)
+
+                            phase_label = "reflect-accept"
+
+                        else:
+
+                            do_shrink = False
+
+                            if float(fr) < worst_value:
+
+                                xc = np.clip(
+                                    centroid + rho * (xr - centroid), -20.0, 20.0
+                                )
+
+                                metric_contract_out = self._evaluate_zernike_optimizer_candidate(
+                                    enabled_terms,
+                                    xc,
+                                    last_loop,
+                                    timeout_s=120.0,
+                                )
+
+                                if metric_contract_out is None:
+
+                                    self.zernike_optimizer_finished.emit(
+                                        False,
+                                        "Optimizer stopped: timed out evaluating Nelder-Mead outside contraction",
+                                    )
+
+                                    return
+
+                                last_loop, fc = metric_contract_out
+
+                                if float(fc) <= float(fr):
+
+                                    simplex[-1] = xc
+
+                                    values[-1] = float(fc)
+
+                                    phase_label = "contract-out"
+
+                                else:
+
+                                    do_shrink = True
+
+                            else:
+
+                                xc = np.clip(
+                                    centroid - rho * (centroid - worst), -20.0, 20.0
+                                )
+
+                                metric_contract_in = self._evaluate_zernike_optimizer_candidate(
+                                    enabled_terms,
+                                    xc,
+                                    last_loop,
+                                    timeout_s=120.0,
+                                )
+
+                                if metric_contract_in is None:
+
+                                    self.zernike_optimizer_finished.emit(
+                                        False,
+                                        "Optimizer stopped: timed out evaluating Nelder-Mead inside contraction",
+                                    )
+
+                                    return
+
+                                last_loop, fc = metric_contract_in
+
+                                if float(fc) < worst_value:
+
+                                    simplex[-1] = xc
+
+                                    values[-1] = float(fc)
+
+                                    phase_label = "contract-in"
+
+                                else:
+
+                                    do_shrink = True
+
+                            if do_shrink:
+
+                                best_vertex = np.array(simplex[0], copy=True)
+
+                                for vertex_idx in range(1, n_dims + 1):
+
+                                    simplex[vertex_idx] = np.clip(
+                                        best_vertex
+                                        + sigma * (simplex[vertex_idx] - best_vertex),
+                                        -20.0,
+                                        20.0,
+                                    )
+
+                                    metric_shrink = self._evaluate_zernike_optimizer_candidate(
+                                        enabled_terms,
+                                        simplex[vertex_idx],
+                                        last_loop,
+                                        timeout_s=120.0,
+                                    )
+
+                                    if metric_shrink is None:
+
+                                        self.zernike_optimizer_finished.emit(
+                                            False,
+                                            "Optimizer stopped: timed out evaluating Nelder-Mead shrink",
+                                        )
+
+                                        return
+
+                                    last_loop, fs = metric_shrink
+
+                                    values[vertex_idx] = float(fs)
+
+                                phase_label = "shrink"
+
+                        order = np.argsort(values)
+
+                        simplex = simplex[order]
+
+                        values = values[order]
+
+                        current_best_xt_db = float(values[0])
+
+                        current_best_theta = np.array(simplex[0], copy=True)
+
+                        if current_best_xt_db < float(best_xt_db):
+
+                            best_xt_db = float(current_best_xt_db)
+
+                            best_theta = np.array(current_best_theta, copy=True)
+
+                        _write_row(
+                            it,
+                            phase_label,
+                            int(last_loop),
+                            float(current_best_xt_db),
+                            float(best_xt_db),
+                            None,
+                            None,
+                            0.0,
+                            float(nm_step),
+                            0.0,
+                            current_best_theta,
                         )
 
-                        return
+                        self.zernike_optimizer_status_updated.emit(
+                            f"Optimizer(Nelder-Mead): iter {it}/{iterations}, XT={current_best_xt_db:.3f} dB (best {float(best_xt_db):.3f} dB)"
+                        )
 
-                    last_loop, current_xt_db = metric_current
+                else:
 
-                    if float(current_xt_db) < float(best_xt_db):
+                    m = np.zeros_like(theta)
 
-                        best_xt_db = float(current_xt_db)
+                    v = np.zeros_like(theta)
 
-                        best_theta = np.array(theta, copy=True)
+                    beta1 = 0.9
 
-                    grad_norm = float(np.linalg.norm(grad))
+                    beta2 = 0.99
 
-                    row: dict[str, object] = {
-                        "timestamp_iso": datetime.now().isoformat(),
-                        "iteration": int(it),
-                        "phase": "update",
-                        "loop_index": int(last_loop),
-                        "xt_db": float(current_xt_db),
-                        "best_xt_db": float(best_xt_db),
-                        "xt_plus_db": float(xt_plus_db),
-                        "xt_minus_db": float(xt_minus_db),
-                        "learning_rate_ak": float(ak),
-                        "perturbation_ck": float(ck),
-                        "gradient_norm": grad_norm,
-                    }
+                    eps = 1e-8
 
-                    for idx, column in enumerate(term_columns):
+                    for it in range(1, int(iterations) + 1):
 
-                        row[column] = float(theta[idx])
+                        if self._zernike_optimizer_stop_event.is_set():
 
-                    writer.writerow(row)
+                            self.zernike_optimizer_finished.emit(
+                                False, "Optimizer stopped by user"
+                            )
 
-                    csv_fp.flush()
+                            return
 
-                    self.zernike_optimizer_status_updated.emit(
-                        f"Optimizer: iter {it}/{iterations}, XT={float(current_xt_db):.3f} dB (best {float(best_xt_db):.3f} dB)"
-                    )
+                        ak = a0 / math.pow(float(it) + 9.0, 0.602)
+
+                        ck = c0 / math.pow(float(it), 0.101)
+
+                        delta = local_rng.choice([-1.0, 1.0], size=theta.shape[0])
+
+                        theta_plus = np.clip(theta + ck * delta, -20.0, 20.0)
+
+                        metric_plus = self._evaluate_zernike_optimizer_candidate(
+                            enabled_terms,
+                            theta_plus,
+                            last_loop,
+                            timeout_s=120.0,
+                        )
+
+                        if metric_plus is None:
+
+                            self.zernike_optimizer_finished.emit(
+                                False, "Optimizer stopped: timed out waiting for XT(+)"
+                            )
+
+                            return
+
+                        last_loop, xt_plus_db = metric_plus
+
+                        theta_minus = np.clip(theta - ck * delta, -20.0, 20.0)
+
+                        metric_minus = self._evaluate_zernike_optimizer_candidate(
+                            enabled_terms,
+                            theta_minus,
+                            last_loop,
+                            timeout_s=120.0,
+                        )
+
+                        if metric_minus is None:
+
+                            self.zernike_optimizer_finished.emit(
+                                False, "Optimizer stopped: timed out waiting for XT(-)"
+                            )
+
+                            return
+
+                        last_loop, xt_minus_db = metric_minus
+
+                        grad_scale = (float(xt_plus_db) - float(xt_minus_db)) / (
+                            2.0 * max(1e-8, float(ck))
+                        )
+
+                        grad = grad_scale * delta
+
+                        m = beta1 * m + (1.0 - beta1) * grad
+
+                        v = beta2 * v + (1.0 - beta2) * (grad * grad)
+
+                        m_hat = m / (1.0 - math.pow(beta1, float(it)))
+
+                        v_hat = v / (1.0 - math.pow(beta2, float(it)))
+
+                        theta = np.clip(
+                            theta - float(ak) * (m_hat / (np.sqrt(v_hat) + eps)),
+                            -20.0,
+                            20.0,
+                        )
+
+                        metric_current = self._evaluate_zernike_optimizer_candidate(
+                            enabled_terms,
+                            theta,
+                            last_loop,
+                            timeout_s=120.0,
+                        )
+
+                        if metric_current is None:
+
+                            self.zernike_optimizer_finished.emit(
+                                False,
+                                "Optimizer stopped: timed out waiting for XT(updated)",
+                            )
+
+                            return
+
+                        last_loop, current_xt_db = metric_current
+
+                        if float(current_xt_db) < float(best_xt_db):
+
+                            best_xt_db = float(current_xt_db)
+
+                            best_theta = np.array(theta, copy=True)
+
+                        grad_norm = float(np.linalg.norm(grad))
+
+                        _write_row(
+                            it,
+                            "update",
+                            int(last_loop),
+                            float(current_xt_db),
+                            float(best_xt_db),
+                            float(xt_plus_db),
+                            float(xt_minus_db),
+                            float(ak),
+                            float(ck),
+                            float(grad_norm),
+                            theta,
+                        )
+
+                        self.zernike_optimizer_status_updated.emit(
+                            f"Optimizer(ASPGD): iter {it}/{iterations}, XT={float(current_xt_db):.3f} dB (best {float(best_xt_db):.3f} dB)"
+                        )
 
             best_coeffs = self._coeff_vector_to_dict(enabled_terms, best_theta)
 
@@ -3043,14 +3382,14 @@ class LiveCameraWindow(QMainWindow):
 
                 self.zernike_optimizer_finished.emit(
                     True,
-                    f"Optimizer finished: best XT={best_xt_db:.3f} dB | coeffs saved {save_info} | csv {history_file_path}",
+                    f"Optimizer finished ({optimizer_algorithm}): best XT={best_xt_db:.3f} dB | coeffs saved {save_info} | csv {history_file_path}",
                 )
 
             else:
 
                 self.zernike_optimizer_finished.emit(
                     True,
-                    f"Optimizer finished: best XT={best_xt_db:.3f} dB | csv {history_file_path} | coeff save failed: {save_info}",
+                    f"Optimizer finished ({optimizer_algorithm}): best XT={best_xt_db:.3f} dB | csv {history_file_path} | coeff save failed: {save_info}",
                 )
 
         except Exception as exc:
@@ -4812,8 +5151,8 @@ class LiveCameraWindow(QMainWindow):
 
     def _frame_handler(self, cam, stream, frame):
         try:
-            frame_mono16 = frame.convert_pixel_format(PixelFormat.Mono16)
-            image = frame_mono16.as_opencv_image().copy()
+            frame_mono8 = frame.convert_pixel_format(PixelFormat.Mono8)
+            image = frame_mono8.as_opencv_image().copy()
 
             with self._frame_lock:
                 self._latest_frame = image
@@ -4980,8 +5319,6 @@ class LiveCameraWindow(QMainWindow):
 
         self._gaussian_mfd_enabled = bool(checked)
 
-        self._gaussian_mfd_frame_buffer.clear()
-
         if not self._gaussian_mfd_enabled:
 
             self.gaussian_mfd_label.setText("Gaussian MFD (pixel pitch 15 um): disabled")
@@ -4989,40 +5326,6 @@ class LiveCameraWindow(QMainWindow):
             return
 
         self.gaussian_mfd_label.setText("Gaussian MFD (pixel pitch 15 um): waiting for frames...")
-
-    def _on_clipping_overlay_toggled(self, checked: bool) -> None:
-
-        self._clipping_overlay_enabled = bool(checked)
-
-        if not self._clipping_overlay_enabled:
-
-            self.clipping_overlay_label.setText("Clipping: disabled")
-
-            return
-
-        self.clipping_overlay_label.setText("Clipping: waiting for frames...")
-
-    def _compute_clipping_mask(self, raw_image: np.ndarray) -> tuple[np.ndarray, int, int, float]:
-        raw = np.asarray(raw_image)
-
-        if raw.ndim != 2:
-            empty = np.zeros((0, 0), dtype=bool)
-            return empty, 0, 0, 0.0
-
-        # FORCE the logic to use your camera's actual max DN
-        # Delete the np.iinfo check so it doesn't default to 65535
-        max_dn = int(self._clipping_overlay_threshold_dn)
-
-        # We use -1 to catch pixels that are right at the edge of saturating
-        threshold_dn = max_dn - 1
-
-        clipped_mask = raw >= threshold_dn
-        clipped_count = int(np.count_nonzero(clipped_mask))
-        total = int(clipped_mask.size)
-        ratio_percent = (100.0 * clipped_count / float(total)) if total > 0 else 0.0
-
-        return clipped_mask, clipped_count, total, ratio_percent
-        
 
     def _on_recovered_points_changed(
         self,
@@ -5032,210 +5335,117 @@ class LiveCameraWindow(QMainWindow):
 
         self._update_recovered_point_readout(point1, point2)
 
-    def _gaussian_1d(
-        self,
-        x: np.ndarray,
-        amplitude: float,
-        mean: float,
-        waist: float,
-        background: float,
-    ) -> np.ndarray:
+    def _fit_gaussian_profile_mfd_um(self, profile: np.ndarray) -> Optional[float]:
 
-        waist_safe = max(1e-12, float(abs(waist)))
+        values = np.asarray(profile, dtype=np.float64).ravel()
 
-        return amplitude * np.exp(-2.0 * ((x - mean) / waist_safe) ** 2) + background
+        if values.size < 7:
+
+            return None
+
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+
+        background = float(np.percentile(values, 10.0))
+
+        signal = values - background
+
+        signal = np.clip(signal, 0.0, None)
+
+        peak_signal = float(np.max(signal))
+
+        if peak_signal <= 0.0:
+
+            return None
+
+        peak_index = int(np.argmax(signal))
+
+        x = np.arange(signal.size, dtype=np.float64) - float(peak_index)
+
+        mask = signal >= (0.1 * peak_signal)
+
+        if int(np.count_nonzero(mask)) < 7:
+
+            mask = signal > 0.0
+
+        if int(np.count_nonzero(mask)) < 7:
+
+            return None
+
+        y_log = np.log(np.clip(signal[mask], 1e-12, None))
+
+        x_fit = x[mask]
+
+        try:
+
+            a, _b, _c = np.polyfit(x_fit, y_log, 2)
+
+        except Exception:
+
+            return None
+
+        if not np.isfinite(a) or a >= -1e-12:
+
+            return None
+
+        waist_px = math.sqrt(-2.0 / float(a))
+
+        mfd_um = 2.0 * waist_px * float(self._gaussian_pixel_pitch_um)
+
+        if not np.isfinite(mfd_um) or mfd_um <= 0.0:
+
+            return None
+
+        max_reasonable_mfd_um = 2.0 * float(signal.size) * float(self._gaussian_pixel_pitch_um)
+
+        if mfd_um > max_reasonable_mfd_um:
+
+            return None
+
+        return float(mfd_um)
 
     def _measure_gaussian_mfd(self, image: np.ndarray) -> tuple[Optional[float], Optional[float], Optional[float], str]:
 
-        if optimize is None or center_of_mass is None:
-            return None, None, None, "scipy missing"
-
         if image.ndim != 2:
+
             return None, None, None, "invalid"
 
-        full_frame = np.asarray(image, dtype=np.float64)
-        frame_h, frame_w = int(full_frame.shape[0]), int(full_frame.shape[1])
-
-        def _auto_patch_from_full_frame() -> tuple[np.ndarray, str]:
-            bg_full = float(np.percentile(full_frame, 5))
-            clean_full = np.maximum(full_frame - bg_full, 0.0)
-
-            if not np.any(clean_full > 0.0):
-                return full_frame, "full frame"
-
-            y_com, x_com = center_of_mass(clean_full)
-            if not np.isfinite(y_com) or not np.isfinite(x_com):
-                y_peak, x_peak = np.unravel_index(np.argmax(clean_full), clean_full.shape)
-                y_c = int(y_peak)
-                x_c = int(x_peak)
-            else:
-                y_c = int(round(float(y_com)))
-                x_c = int(round(float(x_com)))
-
-            y_c = max(0, min(frame_h - 1, y_c))
-            x_c = max(0, min(frame_w - 1, x_c))
-
-            peak = float(np.max(clean_full))
-            if peak <= 0.0:
-                return full_frame, "full frame"
-
-            support_mask = clean_full >= (0.05 * peak)
-            ys, xs = np.where(support_mask)
-
-            if ys.size < 8 or xs.size < 8:
-                half_h = max(32, frame_h // 8)
-                half_w = max(32, frame_w // 8)
-                y0 = max(0, y_c - half_h)
-                y1 = min(frame_h, y_c + half_h)
-                x0 = max(0, x_c - half_w)
-                x1 = min(frame_w, x_c + half_w)
-            else:
-                y0 = max(0, int(np.min(ys)) - 12)
-                y1 = min(frame_h, int(np.max(ys)) + 13)
-                x0 = max(0, int(np.min(xs)) - 12)
-                x1 = min(frame_w, int(np.max(xs)) + 13)
-
-            patch_auto = np.asarray(full_frame[y0:y1, x0:x1], dtype=np.float64)
-            if patch_auto.size == 0:
-                return full_frame, "full frame"
-            return patch_auto, "auto"
-
         roi = self._live_roi
-        if roi is not None:
-            x0, y0, x1, y1 = roi
-            x0 = max(0, min(frame_w, int(x0)))
-            x1 = max(0, min(frame_w, int(x1)))
-            y0 = max(0, min(frame_h, int(y0)))
-            y1 = max(0, min(frame_h, int(y1)))
 
-            if (x1 - x0) >= 7 and (y1 - y0) >= 7:
-                patch = np.asarray(full_frame[y0:y1, x0:x1], dtype=np.float64)
-                source_name = "ROI"
-            else:
-                patch, source_name = _auto_patch_from_full_frame()
+        if roi is not None:
+
+            x0, y0, x1, y1 = roi
+
+            patch = np.asarray(image[y0:y1, x0:x1], dtype=np.float64)
+
+            source_name = "ROI"
+
         else:
-            patch, source_name = _auto_patch_from_full_frame()
+
+            patch = np.asarray(image, dtype=np.float64)
+
+            source_name = "full frame"
 
         if patch.size == 0 or patch.shape[0] < 7 or patch.shape[1] < 7:
+
             return None, None, None, source_name
 
-        background = float(np.percentile(patch, 5))
-        clean_patch = np.maximum(patch - background, 0.0)
+        peak_y, peak_x = np.unravel_index(np.argmax(patch), patch.shape)
 
-        if not np.any(clean_patch > 0.0):
-            return None, None, None, source_name
+        profile_x = patch[peak_y, :]
 
-        y_center_f, x_center_f = center_of_mass(clean_patch)
+        profile_y = patch[:, peak_x]
 
-        if not np.isfinite(y_center_f) or not np.isfinite(x_center_f):
-            peak_y, peak_x = np.unravel_index(np.argmax(clean_patch), clean_patch.shape)
-            y_center = int(peak_y)
-            x_center = int(peak_x)
-        else:
-            y_center = int(round(float(y_center_f)))
-            x_center = int(round(float(x_center_f)))
+        mfd_x_um = self._fit_gaussian_profile_mfd_um(profile_x)
 
-        y_center = max(0, min(int(patch.shape[0]) - 1, y_center))
-        x_center = max(0, min(int(patch.shape[1]) - 1, x_center))
+        mfd_y_um = self._fit_gaussian_profile_mfd_um(profile_y)
 
-        profile_x = patch[y_center, :].astype(np.float64, copy=False)
-        profile_y = patch[:, x_center].astype(np.float64, copy=False)
+        if mfd_x_um is None or mfd_y_um is None:
 
-        x_coords = np.arange(int(patch.shape[1]), dtype=np.float64) * float(
-            self._gaussian_pixel_pitch_um
-        )
-        y_coords = np.arange(int(patch.shape[0]), dtype=np.float64) * float(
-            self._gaussian_pixel_pitch_um
-        )
-
-        x_waist_guess = max(
-            float(self._gaussian_pixel_pitch_um),
-            0.1
-            * float(
-                x_coords[-1] - x_coords[0] + self._gaussian_pixel_pitch_um
-            ),
-        )
-        y_waist_guess = max(
-            float(self._gaussian_pixel_pitch_um),
-            0.1
-            * float(
-                y_coords[-1] - y_coords[0] + self._gaussian_pixel_pitch_um
-            ),
-        )
-
-        amp_x_guess = max(1.0, float(np.max(profile_x) - np.min(profile_x)))
-        amp_y_guess = max(1.0, float(np.max(profile_y) - np.min(profile_y)))
-
-        p0_x = [
-            amp_x_guess,
-            float(x_coords[x_center]),
-            x_waist_guess,
-            float(np.min(profile_x)),
-        ]
-        p0_y = [
-            amp_y_guess,
-            float(y_coords[y_center]),
-            y_waist_guess,
-            float(np.min(profile_y)),
-        ]
-
-        x_span = float(x_coords[-1] - x_coords[0] + self._gaussian_pixel_pitch_um)
-        y_span = float(y_coords[-1] - y_coords[0] + self._gaussian_pixel_pitch_um)
-
-        bounds_x = (
-            [0.0, -np.inf, float(self._gaussian_pixel_pitch_um) * 0.25, -np.inf],
-            [
-                np.inf,
-                np.inf,
-                max(float(self._gaussian_pixel_pitch_um), 2.0 * x_span),
-                np.inf,
-            ],
-        )
-        bounds_y = (
-            [0.0, -np.inf, float(self._gaussian_pixel_pitch_um) * 0.25, -np.inf],
-            [
-                np.inf,
-                np.inf,
-                max(float(self._gaussian_pixel_pitch_um), 2.0 * y_span),
-                np.inf,
-            ],
-        )
-
-        try:
-            fit_x, _ = optimize.curve_fit(
-                self._gaussian_1d,
-                x_coords,
-                profile_x,
-                p0=p0_x,
-                bounds=bounds_x,
-                maxfev=6000,
-            )
-
-            fit_y, _ = optimize.curve_fit(
-                self._gaussian_1d,
-                y_coords,
-                profile_y,
-                p0=p0_y,
-                bounds=bounds_y,
-                maxfev=6000,
-            )
-
-        except Exception:
-            return None, None, None, source_name
-
-        mfd_x_um = 2.0 * abs(float(fit_x[2]))
-        mfd_y_um = 2.0 * abs(float(fit_y[2]))
-
-        if not np.isfinite(mfd_x_um) or not np.isfinite(mfd_y_um):
-            return None, None, None, source_name
-
-        if mfd_x_um <= 0.0 or mfd_y_um <= 0.0:
-            return None, None, None, source_name
+            return mfd_x_um, mfd_y_um, None, source_name
 
         mfd_eq_um = math.sqrt(max(0.0, mfd_x_um * mfd_y_um))
 
-        return float(mfd_x_um), float(mfd_y_um), float(mfd_eq_um), source_name
-
+        return mfd_x_um, mfd_y_um, mfd_eq_um, source_name
 
     def _get_phase_average_window_size(self) -> int:
 
@@ -7613,22 +7823,14 @@ class LiveCameraWindow(QMainWindow):
         phase_rgb = payload["phase_rgb"]
         roi_sum = payload["roi_sum"]
         roi_mean = payload["roi_mean"]
-        image_for_mfd = payload.get("image_for_mfd")
-        raw_image_for_clip = payload.get("raw_image_for_clip")
         pattern_seq = payload["pattern_seq"] # This guarantees sync!
         pattern_idx = payload["pattern_idx"] # This guarantees sync!
         
         self._last_processed_frame_count = frame_count
 
         # --- DATA PROCESSING (Always execute to prevent missing data) ---
-
-        measurement_image = (
-            np.asarray(image_for_mfd, dtype=np.float32, copy=False)
-            if image_for_mfd is not None
-            else image
-        )
-
-        self._handle_phase_calibration_frame(measurement_image, frame_count)
+        
+        self._handle_phase_calibration_frame(image, frame_count)
         self._latest_recovered_field = recovered_field
 
         if roi_sum is not None and roi_mean is not None:
@@ -7660,29 +7862,9 @@ class LiveCameraWindow(QMainWindow):
         now = perf_counter()
         if now - self._last_ui_update_time > 0.033: 
             self._last_ui_update_time = now
-
+            
             # Only update the heavy image labels here
-            if self._clipping_overlay_enabled and raw_image_for_clip is not None:
-                clip_mask, clip_count, clip_total, clip_ratio = self._compute_clipping_mask(
-                    raw_image_for_clip
-                )
-
-                self.clipping_overlay_label.setText(
-                    f"Clipping: {clip_count}/{clip_total} px ({clip_ratio:.4f}%)"
-                )
-
-                if clip_count > 0 and clip_mask.shape == image.shape:
-                    image_rgb = np.repeat(image[..., None], 3, axis=2)
-                    image_rgb = np.ascontiguousarray(image_rgb, dtype=np.uint8)
-                    image_rgb[clip_mask] = np.array([255, 0, 0], dtype=np.uint8)
-                    self.image_label.set_image_rgb_array(image_rgb)
-                else:
-                    self.image_label.set_image_array(image)
-            else:
-                self.image_label.set_image_array(image)
-                if self._clipping_overlay_enabled:
-                    self.clipping_overlay_label.setText("Clipping: waiting for frames...")
-
+            self.image_label.set_image_array(image)
             self.fft_image_label.set_image_array(fft_image)
             
             if phase_rgb is not None:
@@ -7695,32 +7877,15 @@ class LiveCameraWindow(QMainWindow):
                 )
 
             if self._gaussian_mfd_enabled:
-                if image_for_mfd is not None:
-                    self._gaussian_mfd_frame_buffer.append(
-                        np.asarray(image_for_mfd, dtype=np.float32, copy=False)
-                    )
-
-                n_avg = len(self._gaussian_mfd_frame_buffer)
-
-                if n_avg <= 0:
+                mfd_x_um, mfd_y_um, mfd_eq_um, source_name = self._measure_gaussian_mfd(image)
+                if mfd_x_um is None or mfd_y_um is None or mfd_eq_um is None:
                     self.gaussian_mfd_label.setText(
-                        "Gaussian MFD (pixel pitch 15 um): waiting for frames..."
+                        f"Gaussian MFD (pixel pitch 15 um, {source_name}): fit failed"
                     )
                 else:
-                    avg_frame = np.mean(
-                        np.stack(self._gaussian_mfd_frame_buffer, axis=0), axis=0
+                    self.gaussian_mfd_label.setText(
+                        f"Gaussian MFD (pixel pitch 15 um, {source_name}): X={mfd_x_um:.1f} um, Y={mfd_y_um:.1f} um, eq={mfd_eq_um:.1f} um"
                     )
-
-                    mfd_x_um, mfd_y_um, mfd_eq_um, source_name = self._measure_gaussian_mfd(avg_frame)
-
-                    if mfd_x_um is None or mfd_y_um is None or mfd_eq_um is None:
-                        self.gaussian_mfd_label.setText(
-                            f"Gaussian MFD (pixel pitch 15 um, {source_name}, avg={n_avg}): fit failed"
-                        )
-                    else:
-                        self.gaussian_mfd_label.setText(
-                            f"Gaussian MFD (pixel pitch 15 um, {source_name}, avg={n_avg}): X={mfd_x_um:.1f} um, Y={mfd_y_um:.1f} um, eq={mfd_eq_um:.1f} um"
-                        )
             
             if self._fft_roi is None:
                 self.fft_status_label.setText(

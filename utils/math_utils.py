@@ -30,22 +30,106 @@ def normalize_modes_torch(modes):
     return modes / norm
 
 
-def measure_xt_db(matrix):
+def count_complete_groups(total_elements):
+    total = int(max(0, total_elements))
+    complete_groups = 0
+    group_size_needed = 1
+
+    while total >= group_size_needed:
+        complete_groups += 1
+        total -= group_size_needed
+        group_size_needed += 1
+
+    return complete_groups
+
+
+def generate_number_triangle(n):
+    result = []
+    current_num = 0
+
+    for row_length in range(1, int(max(0, n)) + 1):
+        row = []
+        for _ in range(row_length):
+            row.append(current_num)
+            current_num += 1
+        result.append(row)
+
+    return result
+
+
+def measure_xt_db_diagonal(matrix):
     if matrix is None:
         return None
 
-    if torch is not None:
-        matrix_t = matrix if torch.is_tensor(matrix) else torch.as_tensor(matrix)
-        p = torch.abs(matrix_t) ** 2
-        max_col, _ = torch.max(p, dim=0)
-        xt = (torch.sum(p, dim=0) - max_col) / torch.clamp(max_col, min=1e-12)
-        return float(10.0 * torch.log10(torch.clamp(torch.mean(xt), min=1e-12)).item())
+    matrix_t = matrix if torch.is_tensor(matrix) else torch.as_tensor(matrix)
+    p = torch.abs(matrix_t) ** 2
 
-    matrix_np = np.asarray(matrix)
-    p = np.abs(matrix_np) ** 2
-    max_col = np.max(p, axis=0)
-    xt = (np.sum(p, axis=0) - max_col) / np.maximum(max_col, 1e-12)
-    return float(10.0 * np.log10(max(np.mean(xt), 1e-12)))
+    if p.ndim != 2 or p.shape[0] <= 0 or p.shape[1] <= 0:
+        return None
+
+    diag_elements = torch.diag(p)
+    xt = (torch.sum(p, dim=0) - diag_elements) / torch.clamp(diag_elements, min=1e-12)
+
+    return float(
+        10.0 * torch.log10(torch.clamp(torch.mean(xt), min=1e-12)).item()
+    )
+
+
+def measure_xt_db_mode_group(matrix, mode_group_indices, one_based=False):
+    if matrix is None:
+        return None
+
+    matrix_t = matrix if torch.is_tensor(matrix) else torch.as_tensor(matrix)
+    p = torch.abs(matrix_t) ** 2
+
+    if p.ndim != 2 or p.shape[0] <= 0 or p.shape[1] <= 0:
+        return None
+
+    num_modes = int(min(p.shape[0], p.shape[1]))
+
+    if num_modes <= 0:
+        return None
+
+    p = p[:num_modes, :num_modes]
+
+    mg_xt_values = []
+
+    for group in mode_group_indices:
+        if group is None or len(group) <= 0:
+            continue
+
+        group_indices = [int(idx) - 1 if one_based else int(idx) for idx in group]
+        group_indices = [idx for idx in group_indices if 0 <= idx < num_modes]
+
+        if len(group_indices) <= 0:
+            continue
+
+        group_tensor = torch.tensor(group_indices, dtype=torch.long, device=p.device)
+
+        signal_power = torch.sum(p[group_tensor][:, group_tensor])
+
+        mask = torch.ones(num_modes, dtype=torch.bool, device=p.device)
+        mask[group_tensor] = False
+        outside_indices = torch.nonzero(mask, as_tuple=False).flatten()
+
+        if outside_indices.numel() <= 0:
+            xt_power = torch.zeros((), dtype=p.real.dtype, device=p.device)
+        else:
+            xt_power = torch.sum(p[outside_indices][:, group_tensor])
+
+        xt_group = xt_power / torch.clamp(signal_power, min=1e-12)
+        mg_xt_values.append(xt_group)
+
+    if len(mg_xt_values) <= 0:
+        return None
+
+    mg_xt_mean = torch.mean(torch.stack(mg_xt_values))
+    return float(10.0 * torch.log10(torch.clamp(mg_xt_mean, min=1e-12)).item())
+
+
+def measure_xt_db(matrix):
+    # Backward-compatible default metric.
+    return measure_xt_db_diagonal(matrix)
 
 
 def cv_normalize_to_uint8(image: np.ndarray) -> np.ndarray:
