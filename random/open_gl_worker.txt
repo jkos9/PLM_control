@@ -1,0 +1,225 @@
+
+    def _plm_pattern_worker_open_gl_caching_(
+            self, plm_catalog: str, monitor: int, interval_ms: float
+        ) -> None:
+
+            message = "PLM loop stopped."
+
+            # Prevent the Pygame window from minimizing when clicking back to the main GUI
+            os.environ['SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS'] = '0'
+
+            try:
+                phase_patterns = self._plm_phase_patterns
+
+                dynamic_phase_cal = bool(
+                    phase_patterns is None
+                    and self._phase_cal_running
+                    and self._phase_cal_total_patterns > 0
+                    and len(self._phase_cal_pattern_meta) == self._phase_cal_total_patterns
+                )
+
+                if phase_patterns is None and not dynamic_phase_cal:
+                    raise RuntimeError("No phase patterns loaded.")
+
+                plm = PLM.from_db(plm_catalog)
+                expected_h, expected_w = int(plm.shape[0]), int(plm.shape[1])
+
+                if (not dynamic_phase_cal) and (
+                    phase_patterns.shape[1] != expected_h
+                    or phase_patterns.shape[2] != expected_w
+                ):
+                    raise ValueError(
+                        f"Pattern shape {phase_patterns.shape[1:]} does not match PLM shape {(expected_h, expected_w)} for catalog'{plm_catalog}'."
+                    )
+
+                phase_levels, buckets, phase_values = get_phase_values_from_calibration(plm)
+                n_states = int(len(phase_values))
+
+                if n_states <= 0 or len(phase_levels) != n_states:
+                    raise RuntimeError("Invalid PLM calibration LUT.")
+
+                interval_s = max(0.01, interval_ms / 1000.0)
+
+                total_frames = (
+                    int(self._phase_cal_total_patterns)
+                    if dynamic_phase_cal
+                    else int(phase_patterns.shape[0])
+                )
+
+                # ==========================================
+                # OPENGL & PYGAME SETUP
+                # ==========================================
+                pygame.init()
+                pygame.display.gl_set_attribute(pygame.GL_SWAP_CONTROL, 0) # Vsync off
+
+                try:
+                    screen_size = pygame.display.get_desktop_sizes()[monitor]
+                except IndexError:
+                    print(f"Monitor {monitor} not found, falling back to primary monitor.")
+                    screen_size = pygame.display.get_desktop_sizes()[0]
+                    monitor = 0
+
+                # Create OpenGL Fullscreen Window
+                screen = pygame.display.set_mode(
+                    screen_size,
+                    pygame.OPENGL | pygame.FULLSCREEN | pygame.DOUBLEBUF,
+                    display=monitor
+                )
+
+                glViewport(0, 0, screen_size[0], screen_size[1])
+                glMatrixMode(GL_PROJECTION)
+                glLoadIdentity()
+                glOrtho(0, screen_size[0], screen_size[1], 0, -1, 1)
+                glMatrixMode(GL_MODELVIEW)
+                glLoadIdentity()
+
+                glEnable(GL_TEXTURE_2D)
+                tex = glGenTextures(1)
+                glBindTexture(GL_TEXTURE_2D, tex)
+                
+                # CRITICAL for PLMs: Use GL_NEAREST. 
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+
+                x_off = (screen_size[0] - expected_w) // 2
+                y_off = (screen_size[1] - expected_h) // 2
+
+                # ==========================================
+                # PRECOMPUTATION & CACHE STATES
+                # ==========================================
+                cached_bmps = [None] * total_frames
+                cached_overlaid_phases = [None] * total_frames
+                
+                cached_periods = (-1, -1)
+                cached_ramp = np.zeros((expected_h, expected_w), dtype=np.float32)
+                
+                last_zernike = None
+                last_correction = None
+
+                frame_idx = 0
+                
+                # Setting last_update back ensures the first frame processes immediately
+                last_update = perf_counter() - interval_s 
+
+                # ==========================================
+                # MAIN RENDER LOOP
+                # ==========================================
+                last_preview_emit_time = 0.0
+
+                while not self._plm_stop_event.is_set():
+                    now = perf_counter()
+
+                    if now - last_update >= interval_s:
+                        display_idx = frame_idx
+                        t1 = time()
+                        
+                        # 1. DIRTY CHECKING (Did any global parameters change?)
+                        cache_invalid = False
+                        
+                        current_periods = (int(self._grating_period_x_px), int(self._grating_period_y_px))
+                        if current_periods != cached_periods:
+                            cached_ramp = self._build_grating_phase_ramp((expected_h, expected_w), current_periods[0], current_periods[1])
+                            cached_periods = current_periods
+                            cache_invalid = True
+
+                        if dynamic_phase_cal:
+                            current_zernike = np.zeros((expected_h, expected_w), dtype=np.float32)
+                        else:
+                            current_zernike = self._build_zernike_phase_map((expected_h, expected_w))
+                            
+                        if last_zernike is None or not np.array_equal(current_zernike, last_zernike):
+                            cache_invalid = True
+                            last_zernike = current_zernike
+
+                        current_correction = self._get_active_phase_correction_map((expected_h, expected_w))
+                        
+                        if (current_correction is None and last_correction is not None) or \
+                        (current_correction is not None and last_correction is None) or \
+                        (current_correction is not None and not np.array_equal(current_correction, last_correction)):
+                            cache_invalid = True
+                            last_correction = current_correction
+
+                        if cache_invalid:
+                            cached_bmps = [None] * total_frames
+                            cached_overlaid_phases = [None] * total_frames
+
+                        # 2. CACHE RETRIEVAL OR RECOMPUTATION
+                        if cached_bmps[display_idx] is None:
+                            if dynamic_phase_cal:
+                                base_phase = self._build_phase_calibration_pattern_for_index(display_idx, (expected_h, expected_w))
+                                global_grating_phase = np.zeros((expected_h, expected_w), dtype=np.float32)
+                            else:
+                                base_phase = np.mod(phase_patterns[display_idx], 2.0 * np.pi)
+                                global_grating_phase = cached_ramp
+                                
+                            total_phase = base_phase + global_grating_phase + current_zernike
+                            if current_correction is not None:
+                                total_phase += current_correction
+                                
+                            overlaid_phase = np.mod(total_phase, 2.0 * np.pi)
+
+                            state_indices = np.digitize(overlaid_phase, buckets, right=False).astype(np.int32)
+                            state_indices = np.clip(state_indices, 0, n_states - 1)
+                            phase_for_lut = phase_values[state_indices]
+                            
+                            bmp = plm.process_phase_map(phase_for_lut)
+
+                            if not bmp.flags['C_CONTIGUOUS']:
+                                bmp = np.ascontiguousarray(bmp)
+
+                            cached_overlaid_phases[display_idx] = overlaid_phase
+                            cached_bmps[display_idx] = bmp
+
+                        overlaid_phase = cached_overlaid_phases[display_idx]
+                        bmp = cached_bmps[display_idx]
+                        t2 = time()
+
+                        # 3. GUI EMISSION (THROTTLED) AND OPENGL RENDER
+                        # ---> FIX: Limit cross-thread array copying to ~15 FPS max (0.066s)
+                        if now - last_preview_emit_time > 0.066:
+                            self.plm_phase_preview_updated.emit(np.asarray(overlaid_phase, dtype=np.float32))
+                            last_preview_emit_time = now
+
+                        gl_format = GL_RGB if len(bmp.shape) == 3 else GL_LUMINANCE
+
+                        glBindTexture(GL_TEXTURE_2D, tex)
+                        glTexImage2D(GL_TEXTURE_2D, 0, gl_format, expected_w, expected_h, 0, 
+                                    gl_format, GL_UNSIGNED_BYTE, bmp)
+
+                        glClear(GL_COLOR_BUFFER_BIT)
+                        glBegin(GL_QUADS)
+                        glTexCoord2f(0, 0); glVertex2f(x_off, y_off)
+                        glTexCoord2f(1, 0); glVertex2f(x_off + expected_w, y_off)
+                        glTexCoord2f(1, 1); glVertex2f(x_off + expected_w, y_off + expected_h)
+                        glTexCoord2f(0, 1); glVertex2f(x_off, y_off + expected_h)
+                        glEnd()
+
+                        pygame.display.flip()
+                        t3 = time()
+                        
+                        self.plm_counter_updated.emit(display_idx + 1, total_frames)
+                        frame_idx = (frame_idx + 1) % total_frames
+                        last_update = now
+
+                        # ---> FIX: Pump OS events only once per frame (after drawing)
+                        for e in pygame.event.get():
+                            if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                                self._plm_stop_event.set()
+                                break
+
+                    else:
+                        # ---> FIX: Smart Sleep (GIL Release)
+                        # Calculate exact time remaining. Yield the bulk of it to the main PyQt thread,
+                        # and only 'spin' for the last 1ms to maintain strict timing precision.
+                        time_left = interval_s - (now - last_update)
+                        if time_left > 0.002:
+                            sleep(time_left - 0.001)
+
+                message = "PLM loop stopped."
+
+            except Exception as exc:
+                message = f"PLM loop error: {exc}"
+
+            finally:
+                pygame.quit() # Ensure Pygame window closes cleanly
+                self.plm_loop_finished.emit(message)

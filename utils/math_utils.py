@@ -60,19 +60,31 @@ def generate_number_triangle(n):
 def measure_xt_db_diagonal(matrix):
     if matrix is None:
         return None
-
     matrix_t = matrix if torch.is_tensor(matrix) else torch.as_tensor(matrix)
-    p = torch.abs(matrix_t) ** 2
 
-    if p.ndim != 2 or p.shape[0] <= 0 or p.shape[1] <= 0:
+    if matrix_t.ndim != 2 or matrix_t.shape[0] <= 0 or matrix_t.shape[1] <= 0:
         return None
 
-    diag_elements = torch.diag(p)
-    xt = (torch.sum(p, dim=0) - diag_elements) / torch.clamp(diag_elements, min=1e-12)
+    num_modes = int(min(matrix_t.shape[0], matrix_t.shape[1]))
 
-    return float(
-        10.0 * torch.log10(torch.clamp(torch.mean(xt), min=1e-12)).item()
-    )
+    if num_modes <= 0:
+        return None
+
+    matrix_t = matrix_t[:num_modes, :num_modes]
+
+    # Use power-domain coupling for a scalar XT metric.
+    power = torch.abs(matrix_t) ** 2
+    row_power = torch.sum(power, dim=1)
+    diag_power = torch.diagonal(power)
+    off_diag_power = torch.clamp(row_power - diag_power, min=0.0)
+
+    eps = 1e-12
+    xt_linear_per_row = off_diag_power / torch.clamp(diag_power, min=eps)
+    xt_linear = torch.mean(xt_linear_per_row)
+
+    xt_db = 10.0 * torch.log10(torch.clamp(xt_linear, min=eps))
+
+    return float(xt_db.item())
 
 
 def measure_xt_db_mode_group(matrix, mode_group_indices, one_based=False):
