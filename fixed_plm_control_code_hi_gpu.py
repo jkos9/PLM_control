@@ -903,6 +903,12 @@ class LiveCameraWindow(QMainWindow):
         self.zernike_opt_metric_source_combo = QComboBox()
         self.zernike_opt_metric_source_combo.addItem("Diagonal XT", "diag")
         self.zernike_opt_metric_source_combo.addItem("Mode-group XT", "mode_group")
+        self.zernike_opt_metric_source_combo.addItem(
+            "Diagonal XT + In-group power", "diag_plus_in_group"
+        )
+        self.zernike_opt_metric_source_combo.addItem(
+            "Mode-group XT + In-group power", "mode_group_plus_in_group"
+        )
         self.zernike_opt_start_button = QPushButton("Start Optimizer")
         self.zernike_opt_stop_button = QPushButton("Stop Optimizer")
         self.zernike_opt_stop_button.setEnabled(False)
@@ -1052,6 +1058,12 @@ class LiveCameraWindow(QMainWindow):
         self.pattern_max_length_spin.setValue(0)
 
         self.pattern_max_length_spin.setSpecialValueText("All")
+
+        self.pattern_min_index_spin = QSpinBox()
+
+        self.pattern_min_index_spin.setRange(1, 100000)
+
+        self.pattern_min_index_spin.setValue(1)
 
         self.pattern_hold_index_spin = QSpinBox()
 
@@ -1427,7 +1439,9 @@ class LiveCameraWindow(QMainWindow):
             "Channel matrix: waiting for target modes and recovered modes."
         )
 
-        self.channel_matrix_xt_label = QLabel("XT diag/mode-group (dB): n/a / n/a")
+        self.channel_matrix_xt_label = QLabel(
+            "XT diag/mode-group (dB): n/a / n/a | In-group loss: n/a"
+        )
 
         self.channel_matrix_scale_linear_checkbox = QCheckBox(
             "Plot linear scale (relative power)"
@@ -1769,7 +1783,13 @@ class LiveCameraWindow(QMainWindow):
 
         config_row.addSpacing(12)
 
-        config_row.addWidget(QLabel("Max loop length:"))
+        config_row.addWidget(QLabel("Min loop index:"))
+
+        config_row.addWidget(self.pattern_min_index_spin)
+
+        config_row.addSpacing(12)
+
+        config_row.addWidget(QLabel("Max loop index:"))
 
         config_row.addWidget(self.pattern_max_length_spin)
 
@@ -3525,12 +3545,41 @@ class LiveCameraWindow(QMainWindow):
 
         self._on_zernike_coeff_changed(0.0)
 
+    def _decode_optimizer_metric_source(self, metric_source: str) -> tuple[str, bool]:
+
+        source = str(metric_source or "diag")
+
+        if source not in (
+            "diag",
+            "mode_group",
+            "diag_plus_in_group",
+            "mode_group_plus_in_group",
+        ):
+
+            source = "diag"
+
+        use_in_group_loss = source.endswith("_plus_in_group")
+
+        if source.startswith("mode_group"):
+
+            xt_source = "mode_group"
+
+        else:
+
+            xt_source = "diag"
+
+        return xt_source, use_in_group_loss
+
     def _wait_for_next_loop_xt_metric(
         self,
         last_seen_loop: int,
-        xt_source: str,
+        metric_source: str,
         timeout_s: float = 60.0,
     ) -> Optional[tuple[int, float]]:
+
+        xt_source, use_in_group_loss = self._decode_optimizer_metric_source(
+            metric_source
+        )
 
         deadline = perf_counter() + max(0.1, float(timeout_s))
 
@@ -3548,13 +3597,42 @@ class LiveCameraWindow(QMainWindow):
 
                     xt_now = self._channel_matrix_xt_db_diag
 
-                if (
-                    loop_now > int(last_seen_loop)
-                    and xt_now is not None
-                    and np.isfinite(float(xt_now))
-                ):
+                if xt_now is None or not np.isfinite(float(xt_now)):
 
-                    return loop_now, float(xt_now)
+                    xt_ready = False
+
+                else:
+
+                    xt_ready = True
+
+                in_group_ready = True
+
+                in_group_loss_now: Optional[float] = None
+
+                if use_in_group_loss:
+
+                    in_group_loss_now = self._power_in_mode_groups
+
+                    in_group_ready = (
+                        in_group_loss_now is not None
+                        and np.isfinite(float(in_group_loss_now))
+                    )
+
+                if loop_now > int(last_seen_loop) and xt_ready and in_group_ready:
+
+                    xt_value = float(xt_now)
+
+                    if use_in_group_loss and in_group_loss_now is not None:
+
+                        # Convert XT from dB to linear ratio and combine with normalized in-group loss.
+                        xt_linear_loss = float(np.power(10.0, xt_value / 10.0))
+
+                        combined_loss = xt_linear_loss + float(in_group_loss_now)
+                        print(f'power in mode groups: {in_group_loss_now:.6e}, xt linear loss: {xt_linear_loss:.6e}, combined loss: {combined_loss:.6e}')
+
+                        return loop_now, float(combined_loss)
+
+                    return loop_now, xt_value
 
                 remaining = deadline - perf_counter()
 
@@ -3645,7 +3723,7 @@ class LiveCameraWindow(QMainWindow):
         enabled_terms: list[tuple[int, int]],
         coeff_vector: np.ndarray,
         last_loop: int,
-        xt_source: str,
+        metric_source: str,
         timeout_s: float = 120.0,
     ) -> Optional[tuple[int, float]]:
 
@@ -3655,7 +3733,7 @@ class LiveCameraWindow(QMainWindow):
 
         return self._wait_for_next_loop_xt_metric(
             last_loop,
-            xt_source=xt_source,
+            metric_source=metric_source,
             timeout_s=timeout_s,
         )
 
@@ -3759,17 +3837,22 @@ class LiveCameraWindow(QMainWindow):
 
         self._zernike_optimizer_algorithm = optimizer_algorithm
 
-        optimizer_xt_source = str(
+        optimizer_metric_source = str(
             self.zernike_opt_metric_source_combo.currentData()
             or self._zernike_optimizer_xt_source
             or "diag"
         )
 
-        if optimizer_xt_source not in ("diag", "mode_group"):
+        if optimizer_metric_source not in (
+            "diag",
+            "mode_group",
+            "diag_plus_in_group",
+            "mode_group_plus_in_group",
+        ):
 
-            optimizer_xt_source = "diag"
+            optimizer_metric_source = "diag"
 
-        self._zernike_optimizer_xt_source = optimizer_xt_source
+        self._zernike_optimizer_xt_source = optimizer_metric_source
 
         results_path = self.zernike_opt_results_path_edit.text().strip()
 
@@ -3784,7 +3867,7 @@ class LiveCameraWindow(QMainWindow):
         self.zernike_opt_stop_button.setEnabled(True)
 
         self._set_zernike_optimizer_status(
-            f"Optimizer: running ({optimizer_algorithm}, XT={optimizer_xt_source})"
+            f"Optimizer: running ({optimizer_algorithm}, metric={optimizer_metric_source})"
         )
 
         self._zernike_optimizer_thread = threading.Thread(
@@ -3797,7 +3880,7 @@ class LiveCameraWindow(QMainWindow):
                 perturbation,
                 max_degree,
                 optimizer_algorithm,
-                optimizer_xt_source,
+                optimizer_metric_source,
                 results_path,
                 history_path,
             ),
@@ -3840,7 +3923,7 @@ class LiveCameraWindow(QMainWindow):
         perturbation: float,
         max_degree: int,
         optimizer_algorithm: str,
-        optimizer_xt_source: str,
+        optimizer_metric_source: str,
         results_path: str,
         history_path: str,
     ) -> None:
@@ -3985,11 +4068,16 @@ class LiveCameraWindow(QMainWindow):
 
                 optimizer_algorithm = "aspgd"
 
-            optimizer_xt_source = str(optimizer_xt_source or "diag")
+            optimizer_metric_source = str(optimizer_metric_source or "diag")
 
-            if optimizer_xt_source not in ("diag", "mode_group"):
+            if optimizer_metric_source not in (
+                "diag",
+                "mode_group",
+                "diag_plus_in_group",
+                "mode_group_plus_in_group",
+            ):
 
-                optimizer_xt_source = "diag"
+                optimizer_metric_source = "diag"
 
             local_rng = np.random.default_rng()
 
@@ -4138,7 +4226,7 @@ class LiveCameraWindow(QMainWindow):
                         "perturbation_ck": float(ck_value),
                         "gradient_norm": float(grad_norm_value),
                         "optimizer_algorithm": str(optimizer_algorithm),
-                        "xt_source": str(optimizer_xt_source),
+                        "xt_source": str(optimizer_metric_source),
                     }
 
                     for idx, column in enumerate(term_columns):
@@ -4152,14 +4240,14 @@ class LiveCameraWindow(QMainWindow):
                 last_loop = int(self._completed_pattern_loops)
 
                 self.zernike_optimizer_status_updated.emit(
-                    f"Optimizer: baseline evaluation ({optimizer_algorithm}, XT={optimizer_xt_source})"
+                    f"Optimizer: baseline evaluation ({optimizer_algorithm}, metric={optimizer_metric_source})"
                 )
 
                 baseline_metric = self._evaluate_zernike_optimizer_candidate(
                     enabled_terms,
                     theta,
                     last_loop,
-                    xt_source=optimizer_xt_source,
+                    metric_source=optimizer_metric_source,
                     timeout_s=120.0,
                 )
 
@@ -4216,7 +4304,7 @@ class LiveCameraWindow(QMainWindow):
                             enabled_terms,
                             simplex[vertex_idx],
                             last_loop,
-                            xt_source=optimizer_xt_source,
+                            metric_source=optimizer_metric_source,
                             timeout_s=120.0,
                         )
 
@@ -4285,7 +4373,7 @@ class LiveCameraWindow(QMainWindow):
                             enabled_terms,
                             xr,
                             last_loop,
-                            xt_source=optimizer_xt_source,
+                            metric_source=optimizer_metric_source,
                             timeout_s=120.0,
                         )
 
@@ -4308,7 +4396,7 @@ class LiveCameraWindow(QMainWindow):
                                 enabled_terms,
                                 xe,
                                 last_loop,
-                                xt_source=optimizer_xt_source,
+                                metric_source=optimizer_metric_source,
                                 timeout_s=120.0,
                             )
 
@@ -4359,7 +4447,7 @@ class LiveCameraWindow(QMainWindow):
                                     enabled_terms,
                                     xc,
                                     last_loop,
-                                    xt_source=optimizer_xt_source,
+                                    metric_source=optimizer_metric_source,
                                     timeout_s=120.0,
                                 )
 
@@ -4394,7 +4482,7 @@ class LiveCameraWindow(QMainWindow):
                                     enabled_terms,
                                     xc,
                                     last_loop,
-                                    xt_source=optimizer_xt_source,
+                                    metric_source=optimizer_metric_source,
                                     timeout_s=120.0,
                                 )
 
@@ -4436,7 +4524,7 @@ class LiveCameraWindow(QMainWindow):
                                         enabled_terms,
                                         simplex[vertex_idx],
                                         last_loop,
-                                        xt_source=optimizer_xt_source,
+                                        metric_source=optimizer_metric_source,
                                         timeout_s=120.0,
                                     )
 
@@ -4486,7 +4574,7 @@ class LiveCameraWindow(QMainWindow):
                         )
 
                         self.zernike_optimizer_status_updated.emit(
-                            f"Optimizer(Nelder-Mead, XT={optimizer_xt_source}): iter {it}/{iterations}, XT={current_best_xt_db:.3f} dB (best {float(best_xt_db):.3f} dB)"
+                            f"Optimizer(Nelder-Mead, metric={optimizer_metric_source}): iter {it}/{iterations}, loss={current_best_xt_db:.6f} (best {float(best_xt_db):.6f})"
                         )
 
                 elif optimizer_algorithm == "stochastic_hill_climb":
@@ -4513,7 +4601,7 @@ class LiveCameraWindow(QMainWindow):
                             enabled_terms,
                             candidate_theta,
                             last_loop,
-                            xt_source=optimizer_xt_source,
+                            metric_source=optimizer_metric_source,
                             timeout_s=120.0,
                         )
 
@@ -4541,7 +4629,7 @@ class LiveCameraWindow(QMainWindow):
                             phase_label = "accept"
 
                             self.zernike_optimizer_status_updated.emit(
-                                f"Optimizer(Stochastic Hill Climb, XT={optimizer_xt_source}): iter {it}/{iterations}, improved XT={float(best_xt_db):.3f} dB"
+                                f"Optimizer(Stochastic Hill Climb, metric={optimizer_metric_source}): iter {it}/{iterations}, improved loss={float(best_xt_db):.6f}"
                             )
 
                         else:
@@ -4551,7 +4639,7 @@ class LiveCameraWindow(QMainWindow):
                             phase_label = "reject"
 
                             self.zernike_optimizer_status_updated.emit(
-                                f"Optimizer(Stochastic Hill Climb, XT={optimizer_xt_source}): iter {it}/{iterations}, XT={float(candidate_xt_db):.3f} dB (best {float(best_xt_db):.3f} dB)"
+                                f"Optimizer(Stochastic Hill Climb, metric={optimizer_metric_source}): iter {it}/{iterations}, loss={float(candidate_xt_db):.6f} (best {float(best_xt_db):.6f})"
                             )
 
                         _write_row(
@@ -4605,7 +4693,7 @@ class LiveCameraWindow(QMainWindow):
                             enabled_terms,
                             theta_plus,
                             last_loop,
-                            xt_source=optimizer_xt_source,
+                            metric_source=optimizer_metric_source,
                             timeout_s=120.0,
                         )
 
@@ -4625,7 +4713,7 @@ class LiveCameraWindow(QMainWindow):
                             enabled_terms,
                             theta_minus,
                             last_loop,
-                            xt_source=optimizer_xt_source,
+                            metric_source=optimizer_metric_source,
                             timeout_s=120.0,
                         )
 
@@ -4661,7 +4749,7 @@ class LiveCameraWindow(QMainWindow):
                             enabled_terms,
                             theta,
                             last_loop,
-                            xt_source=optimizer_xt_source,
+                            metric_source=optimizer_metric_source,
                             timeout_s=120.0,
                         )
 
@@ -4699,7 +4787,7 @@ class LiveCameraWindow(QMainWindow):
                         )
 
                         self.zernike_optimizer_status_updated.emit(
-                            f"Optimizer(ASPGD, XT={optimizer_xt_source}): iter {it}/{iterations}, XT={float(current_xt_db):.3f} dB (best {float(best_xt_db):.3f} dB)"
+                            f"Optimizer(ASPGD, metric={optimizer_metric_source}): iter {it}/{iterations}, loss={float(current_xt_db):.6f} (best {float(best_xt_db):.6f})"
                         )
 
             best_coeffs = self._coeff_vector_to_dict(enabled_terms, best_theta)
@@ -4720,14 +4808,14 @@ class LiveCameraWindow(QMainWindow):
 
                 self.zernike_optimizer_finished.emit(
                     True,
-                    f"Optimizer finished ({optimizer_algorithm}, XT={optimizer_xt_source}): best XT={best_xt_db:.3f} dB | coeffs saved {save_info} | csv {history_file_path}",
+                    f"Optimizer finished ({optimizer_algorithm}, metric={optimizer_metric_source}): best loss={best_xt_db:.6f} | coeffs saved {save_info} | csv {history_file_path}",
                 )
 
             else:
 
                 self.zernike_optimizer_finished.emit(
                     True,
-                    f"Optimizer finished ({optimizer_algorithm}, XT={optimizer_xt_source}): best XT={best_xt_db:.3f} dB | csv {history_file_path} | coeff save failed: {save_info}",
+                    f"Optimizer finished ({optimizer_algorithm}, metric={optimizer_metric_source}): best loss={best_xt_db:.6f} | csv {history_file_path} | coeff save failed: {save_info}",
                 )
 
         except Exception as exc:
@@ -4959,6 +5047,32 @@ class LiveCameraWindow(QMainWindow):
             return
 
         self.pattern_counter_label.setText(f"Pattern: {current_index} / {total_count}")
+
+    def _get_active_pattern_loop_bounds(
+        self, total_patterns: int
+    ) -> tuple[int, int, int]:
+
+        total = max(1, int(total_patterns))
+
+        start_idx = max(1, min(total, int(self.pattern_min_index_spin.value())))
+
+        stop_raw = int(self.pattern_max_length_spin.value())
+
+        if stop_raw <= 0:
+
+            stop_idx = total
+
+        else:
+
+            stop_idx = max(1, min(total, int(stop_raw)))
+
+        if stop_idx < start_idx:
+
+            stop_idx = start_idx
+
+        active_count = max(1, int(stop_idx - start_idx + 1))
+
+        return int(start_idx), int(stop_idx), int(active_count)
 
     def _clear_pattern_gallery(self) -> None:
         while self.pattern_gallery_grid.count() > 0:
@@ -5356,7 +5470,9 @@ class LiveCameraWindow(QMainWindow):
 
         elif self._plm_phase_patterns is not None and np.asarray(self._plm_phase_patterns).ndim >= 3:
 
-            pattern_len = int(np.asarray(self._plm_phase_patterns).shape[0])
+            _start_idx, _stop_idx, pattern_len = self._get_active_pattern_loop_bounds(
+                int(np.asarray(self._plm_phase_patterns).shape[0])
+            )
 
         if pattern_len <= 0:
 
@@ -5420,8 +5536,14 @@ class LiveCameraWindow(QMainWindow):
             else f"{self._channel_matrix_xt_db_mode_group:.3f}"
         )
 
+        in_group_loss_text = (
+            "n/a"
+            if self._power_in_mode_groups is None
+            else f"{self._power_in_mode_groups:.6f}"
+        )
+
         self.channel_matrix_xt_label.setText(
-            f"XT diag/mode-group (dB): {diag_text} / {mode_group_text}"
+            f"XT diag/mode-group (dB): {diag_text} / {mode_group_text} | In-group loss: {in_group_loss_text}"
         )
 
     def _recompute_channel_matrix(self) -> None:
@@ -5435,6 +5557,8 @@ class LiveCameraWindow(QMainWindow):
             self._channel_matrix_xt_db_diag = None
 
             self._channel_matrix_xt_db_mode_group = None
+
+            self._power_in_mode_groups = None
 
             self._update_channel_matrix_xt_label()
 
@@ -5450,19 +5574,13 @@ class LiveCameraWindow(QMainWindow):
 
             self._channel_matrix_xt_db_mode_group = None
 
+            self._power_in_mode_groups = None
+
             self._update_channel_matrix_xt_label()
 
             return
 
         target_modes = np.ascontiguousarray(self._target_modes)
-
-        configured_limit = int(self.pattern_max_length_spin.value())
-
-        if configured_limit > 0:
-
-            target_modes = np.ascontiguousarray(
-                target_modes[: min(int(target_modes.shape[0]), configured_limit)]
-            )
 
         loaded_pattern_count = 0
 
@@ -5473,9 +5591,11 @@ class LiveCameraWindow(QMainWindow):
 
             loaded_pattern_count = int(np.asarray(self._plm_phase_patterns).shape[0])
 
-            if configured_limit > 0:
+            _start_idx, _stop_idx, active_count = self._get_active_pattern_loop_bounds(
+                int(loaded_pattern_count)
+            )
 
-                loaded_pattern_count = min(int(loaded_pattern_count), configured_limit)
+            loaded_pattern_count = int(active_count)
 
         if 0 < loaded_pattern_count < int(target_modes.shape[0]):
 
@@ -5489,10 +5609,6 @@ class LiveCameraWindow(QMainWindow):
         ):
 
             expected_modes = int(self._current_plm_total_patterns)
-
-            if configured_limit > 0:
-
-                expected_modes = min(int(expected_modes), configured_limit)
 
         elif loaded_pattern_count > 0:
 
@@ -5591,6 +5707,18 @@ class LiveCameraWindow(QMainWindow):
                 None if mode_group_xt_db is None else float(mode_group_xt_db)
             )
 
+            self._power_in_mode_groups = (
+                measure_in_group_power(
+                    self._channel_matrix,
+                    mode_group_indices,
+                    one_based=False,
+                    normalize=True,
+                    return_as_loss=True,
+                )
+                if len(mode_group_indices) > 0
+                else None
+            )
+
             # Keep backward-compatible scalar XT for optimizer code paths.
             self._channel_matrix_xt_db = self._channel_matrix_xt_db_diag
 
@@ -5609,6 +5737,8 @@ class LiveCameraWindow(QMainWindow):
             self._channel_matrix_xt_db_diag = None
 
             self._channel_matrix_xt_db_mode_group = None
+
+            self._power_in_mode_groups = None
 
             self._update_channel_matrix_xt_label()
 
@@ -5635,24 +5765,14 @@ class LiveCameraWindow(QMainWindow):
 
             expected_modes = int(self._current_plm_total_patterns)
 
-            configured_limit = int(self.pattern_max_length_spin.value())
-
-            if configured_limit > 0:
-
-                expected_modes = min(int(expected_modes), configured_limit)
-
         elif (
             self._plm_phase_patterns is not None
             and np.asarray(self._plm_phase_patterns).ndim >= 3
         ):
 
-            expected_modes = int(np.asarray(self._plm_phase_patterns).shape[0])
-
-            configured_limit = int(self.pattern_max_length_spin.value())
-
-            if configured_limit > 0:
-
-                expected_modes = min(int(expected_modes), configured_limit)
+            _start_idx, _stop_idx, expected_modes = self._get_active_pattern_loop_bounds(
+                int(np.asarray(self._plm_phase_patterns).shape[0])
+            )
 
         else:
 
@@ -5716,6 +5836,8 @@ class LiveCameraWindow(QMainWindow):
         self._channel_matrix_xt_db_diag = None
 
         self._channel_matrix_xt_db_mode_group = None
+
+        self._power_in_mode_groups = None
 
         self._channel_matrix_dirty = True
 
@@ -9758,6 +9880,12 @@ class LiveCameraWindow(QMainWindow):
 
             self.pattern_hold_index_spin.setMaximum(max(1, int(arr.shape[0])))
 
+            self.pattern_min_index_spin.setMaximum(max(1, int(arr.shape[0])))
+
+            if int(self.pattern_min_index_spin.value()) > int(arr.shape[0]):
+
+                self.pattern_min_index_spin.setValue(int(arr.shape[0]))
+
             if int(self.pattern_hold_index_spin.value()) > int(arr.shape[0]):
 
                 self.pattern_hold_index_spin.setValue(0)
@@ -9793,6 +9921,10 @@ class LiveCameraWindow(QMainWindow):
             self.pattern_hold_index_spin.setMaximum(100000)
 
             self.pattern_hold_index_spin.setValue(0)
+
+            self.pattern_min_index_spin.setMaximum(100000)
+
+            self.pattern_min_index_spin.setValue(1)
 
             self.pattern_info_label.setText("")
 
@@ -9835,6 +9967,10 @@ class LiveCameraWindow(QMainWindow):
 
         if dynamic_phase_cal:
 
+            loop_start_index = 1
+
+            loop_stop_index = int(self._phase_cal_total_patterns)
+
             total_for_counter = int(self._phase_cal_total_patterns)
 
             hold_pattern_index = 0
@@ -9843,15 +9979,30 @@ class LiveCameraWindow(QMainWindow):
 
             available_patterns = int(self._plm_phase_patterns.shape[0])
 
-            configured_limit = int(self.pattern_max_length_spin.value())
+            loop_start_index = max(
+                1,
+                min(available_patterns, int(self.pattern_min_index_spin.value())),
+            )
 
-            if configured_limit > 0:
+            max_loop_index_raw = int(self.pattern_max_length_spin.value())
 
-                total_for_counter = max(1, min(available_patterns, configured_limit))
+            if max_loop_index_raw <= 0:
+
+                loop_stop_index = int(available_patterns)
 
             else:
 
-                total_for_counter = available_patterns
+                loop_stop_index = max(1, min(available_patterns, max_loop_index_raw))
+
+            if int(loop_stop_index) < int(loop_start_index):
+
+                self.pattern_status_label.setText(
+                    f"Max loop index {int(loop_stop_index)} must be >= min loop index {int(loop_start_index)}."
+                )
+
+                return
+
+            total_for_counter = int(loop_stop_index - loop_start_index + 1)
 
             hold_pattern_index = int(self.pattern_hold_index_spin.value())
 
@@ -9873,7 +10024,8 @@ class LiveCameraWindow(QMainWindow):
                 plm_catalog,
                 monitor,
                 interval_ms,
-                total_for_counter,
+                int(loop_start_index),
+                int(loop_stop_index),
                 int(hold_pattern_index),
             ),
             daemon=True,
@@ -9896,13 +10048,13 @@ class LiveCameraWindow(QMainWindow):
         if int(hold_pattern_index) > 0:
 
             self.pattern_status_label.setText(
-                f"Starting PLM loop (length {total_for_counter}, holding pattern {int(hold_pattern_index)})..."
+                f"Starting PLM loop (range {int(loop_start_index)}:{int(loop_stop_index)}, length {total_for_counter}, holding pattern {int(hold_pattern_index)})..."
             )
 
         else:
 
             self.pattern_status_label.setText(
-                f"Starting PLM pattern loop (length {total_for_counter})..."
+                f"Starting PLM pattern loop (range {int(loop_start_index)}:{int(loop_stop_index)}, length {total_for_counter})..."
             )
 
     def _stop_plm_pattern_loop(self) -> None:
@@ -9927,7 +10079,8 @@ class LiveCameraWindow(QMainWindow):
         plm_catalog: str,
         monitor: int,
         interval_ms: float,
-        total_frames_override: int,
+        loop_start_index: int,
+        loop_stop_index: int,
         hold_pattern_index: int,
     ) -> None:
 
@@ -9987,19 +10140,35 @@ class LiveCameraWindow(QMainWindow):
 
                 last_update = perf_counter() - interval_s
 
-                total_frames = (
-                    int(self._phase_cal_total_patterns)
-                    if dynamic_phase_cal
-                    else max(
+                if dynamic_phase_cal:
+
+                    loop_start_0_based = 0
+
+                    total_frames = int(self._phase_cal_total_patterns)
+
+                else:
+
+                    available_frames = int(phase_patterns.shape[0])
+
+                    start_idx_1_based = max(
                         1,
-                        min(
-                            int(phase_patterns.shape[0]),
-                            int(total_frames_override)
-                            if int(total_frames_override) > 0
-                            else int(phase_patterns.shape[0]),
-                        ),
+                        min(available_frames, int(loop_start_index)),
                     )
-                )
+
+                    stop_idx_1_based = max(
+                        1,
+                        min(available_frames, int(loop_stop_index)),
+                    )
+
+                    if int(stop_idx_1_based) < int(start_idx_1_based):
+
+                        raise ValueError(
+                            f"Invalid loop range: start {int(start_idx_1_based)} > stop {int(stop_idx_1_based)}"
+                        )
+
+                    loop_start_0_based = int(start_idx_1_based - 1)
+
+                    total_frames = int(stop_idx_1_based - start_idx_1_based + 1)
 
                 hold_idx_1_based = (
                     0
@@ -10125,9 +10294,9 @@ class LiveCameraWindow(QMainWindow):
 
                     if now - last_update >= interval_s:
                         display_idx = (
-                            int(hold_idx_0_based)
+                            int(loop_start_0_based + hold_idx_0_based)
                             if int(hold_idx_0_based) >= 0
-                            else int(frame_idx)
+                            else int(loop_start_0_based + frame_idx)
                         )
                         overlaid_phase = _compose_overlaid_phase(display_idx)
                         self.plm_phase_preview_updated.emit(
@@ -10154,7 +10323,13 @@ class LiveCameraWindow(QMainWindow):
                         print(f"Loop timing: compose {t2 - t1:.3f}s, display {t3 - t2:.3f}s")
 
 
-                        self.plm_counter_updated.emit(display_idx + 1, total_frames)
+                        counter_idx_1_based = (
+                            int(hold_idx_1_based)
+                            if int(hold_idx_0_based) >= 0
+                            else int(frame_idx + 1)
+                        )
+
+                        self.plm_counter_updated.emit(counter_idx_1_based, total_frames)
                         if int(hold_idx_0_based) < 0:
 
                             frame_idx = (frame_idx + 1) % total_frames
@@ -10162,7 +10337,9 @@ class LiveCameraWindow(QMainWindow):
 
                 win.loop_callback = loop_callback
                 initial_display_idx = (
-                    int(hold_idx_0_based) if int(hold_idx_0_based) >= 0 else 0
+                    int(loop_start_0_based + hold_idx_0_based)
+                    if int(hold_idx_0_based) >= 0
+                    else int(loop_start_0_based)
                 )
                 initial_phase_overlaid = _compose_overlaid_phase(initial_display_idx)
                 self.plm_phase_preview_updated.emit(
@@ -10177,7 +10354,10 @@ class LiveCameraWindow(QMainWindow):
                 initial_phase = phase_values[initial_state_indices]
 
                 win.load(Image.fromarray(plm.process_phase_map(initial_phase)))
-                self.plm_counter_updated.emit(initial_display_idx + 1, total_frames)
+                initial_counter_idx_1_based = (
+                    int(hold_idx_1_based) if int(hold_idx_0_based) >= 0 else 1
+                )
+                self.plm_counter_updated.emit(initial_counter_idx_1_based, total_frames)
                 win.run()
 
             if self._plm_stop_event.is_set():
