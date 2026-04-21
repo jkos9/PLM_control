@@ -138,6 +138,61 @@ def measure_xt_db_mode_group(matrix, mode_group_indices, one_based=False):
     mg_xt_mean = torch.mean(torch.stack(mg_xt_values))
     return float(10.0 * torch.log10(torch.clamp(mg_xt_mean, min=1e-12)).item())
 
+def measure_in_group_power(matrix, mode_group_indices, one_based=False, normalize=True, return_as_loss=True):
+    if matrix is None:
+        return None
+
+    matrix_t = matrix if torch.is_tensor(matrix) else torch.as_tensor(matrix)
+    
+    # Calculate power matrix
+    p = torch.abs(matrix_t) ** 2
+
+    if p.ndim != 2 or p.shape[0] <= 0 or p.shape[1] <= 0:
+        return None
+
+    num_modes = int(min(p.shape[0], p.shape[1]))
+
+    if num_modes <= 0:
+        return None
+
+    p = p[:num_modes, :num_modes]
+
+    total_signal_power = torch.zeros((), dtype=p.real.dtype, device=p.device)
+
+    for group in mode_group_indices:
+        if group is None or len(group) <= 0:
+            continue
+
+        group_indices = [int(idx) - 1 if one_based else int(idx) for idx in group]
+        group_indices = [idx for idx in group_indices if 0 <= idx < num_modes]
+
+        if len(group_indices) <= 0:
+            continue
+
+        group_tensor = torch.tensor(group_indices, dtype=torch.long, device=p.device)
+
+        # Sum the power within this specific mode group block 
+        # (rows = launched modes in group, cols = received modes in group)
+        signal_power = torch.sum(p[group_tensor][:, group_tensor])
+        total_signal_power += signal_power
+
+    # Normalize against the total power in the matrix to get efficiency
+    if normalize:
+        total_matrix_power = torch.sum(p)
+        power_metric = total_signal_power / torch.clamp(total_matrix_power, min=1e-12)
+    else:
+        power_metric = total_signal_power
+
+    # Optimizers minimize the loss metric. 
+    # If normalizing, we minimize (1.0 - ratio). If raw power, we minimize (-power).
+    if return_as_loss:
+        if normalize:
+            return float((1.0 - power_metric).item())
+        else:
+            return -float(power_metric.item())
+
+    return float(power_metric.item())
+
 
 def measure_xt_db(matrix):
     # Backward-compatible default metric.

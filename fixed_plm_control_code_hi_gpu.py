@@ -871,21 +871,16 @@ class LiveCameraWindow(QMainWindow):
         self.focal_lens_edit = QLineEdit("0")
         self.focal_lens_edit.setMaximumWidth(100)
         self.focal_lens_value_label = QLabel("Off")
-        self._zernike_terms = self._enumerate_zernike_terms(5)
+        self._zernike_terms = self._enumerate_zernike_terms(2)
         self._zernike_coeff_spins: dict[tuple[int, int], QDoubleSpinBox] = {}
+        self._zernike_optimize_checks: dict[tuple[int, int], QCheckBox] = {}
         self._zernike_row_widgets: dict[
-            tuple[int, int], tuple[QLabel, QDoubleSpinBox]
+            tuple[int, int], tuple[QLabel, QDoubleSpinBox, QCheckBox]
         ] = {}
 
         self.zernike_status_label = QLabel("Active Zernike terms: 0")
         self.zernike_reset_button = QPushButton("Reset all to 0")
         self.zernike_load_button = QPushButton("Load Best Coefficients")
-        self.zernike_max_degree_combo = QComboBox()
-
-        for degree in range(0, 6):
-            self.zernike_max_degree_combo.addItem(str(degree), degree)
-
-        self.zernike_max_degree_combo.setCurrentIndex(5)
         self.zernike_opt_iterations_spin = QSpinBox()
         self.zernike_opt_iterations_spin.setRange(1, 1000)
         self.zernike_opt_iterations_spin.setValue(25)
@@ -1098,7 +1093,65 @@ class LiveCameraWindow(QMainWindow):
 
         self.hologram_scale_y_spin.setEnabled(False)
 
-        self.hologram_scale_status_label = QLabel("Hologram scaling: off")
+        self.hologram_scale_optimize_x_checkbox = QCheckBox("Optimize X scale")
+
+        self.hologram_scale_optimize_y_checkbox = QCheckBox("Optimize Y scale")
+
+        self.hologram_scale_perturb_spin = QDoubleSpinBox()
+
+        self.hologram_scale_perturb_spin.setDecimals(4)
+
+        self.hologram_scale_perturb_spin.setRange(0.0001, 10.0)
+
+        self.hologram_scale_perturb_spin.setSingleStep(0.01)
+
+        self.hologram_scale_perturb_spin.setValue(0.05)
+
+        self.hologram_shift_x_checkbox = QCheckBox("Shift X")
+
+        self.hologram_shift_x_spin = QSpinBox()
+
+        self.hologram_shift_x_spin.setRange(-10000, 10000)
+
+        self.hologram_shift_x_spin.setSingleStep(1)
+
+        self.hologram_shift_x_spin.setValue(0)
+
+        self.hologram_shift_x_spin.setSuffix(" px")
+
+        self.hologram_shift_x_spin.setEnabled(False)
+
+        self.hologram_shift_y_checkbox = QCheckBox("Shift Y")
+
+        self.hologram_shift_y_spin = QSpinBox()
+
+        self.hologram_shift_y_spin.setRange(-10000, 10000)
+
+        self.hologram_shift_y_spin.setSingleStep(1)
+
+        self.hologram_shift_y_spin.setValue(0)
+
+        self.hologram_shift_y_spin.setSuffix(" px")
+
+        self.hologram_shift_y_spin.setEnabled(False)
+
+        self.hologram_shift_optimize_x_checkbox = QCheckBox("Optimize X shift")
+
+        self.hologram_shift_optimize_y_checkbox = QCheckBox("Optimize Y shift")
+
+        self.hologram_shift_perturb_spin = QDoubleSpinBox()
+
+        self.hologram_shift_perturb_spin.setDecimals(3)
+
+        self.hologram_shift_perturb_spin.setRange(0.001, 1000.0)
+
+        self.hologram_shift_perturb_spin.setSingleStep(0.1)
+
+        self.hologram_shift_perturb_spin.setValue(1.0)
+
+        self.hologram_shift_perturb_spin.setSuffix(" px")
+
+        self.hologram_scale_status_label = QLabel("Hologram transform: off")
 
         self.pattern_start_button = QPushButton("Start PLM Loop")
 
@@ -1481,18 +1534,66 @@ class LiveCameraWindow(QMainWindow):
         zernike_layout = QVBoxLayout()
 
         zernike_layout.addWidget(
-            QLabel("Zernike polynomial coefficients (radians), radial degree n ≤ 5")
+            QLabel("Zernike polynomial coefficients (radians), radial degree n ≤ 2")
         )
 
-        zernike_degree_row = QHBoxLayout()
+        zernike_scale_row = QHBoxLayout()
 
-        zernike_degree_row.addWidget(QLabel("Show terms up to radial degree n:"))
+        zernike_scale_row.addWidget(QLabel("Hologram scaling:"))
 
-        zernike_degree_row.addWidget(self.zernike_max_degree_combo)
+        zernike_scale_row.addWidget(self.hologram_scale_x_checkbox)
 
-        zernike_degree_row.addStretch(1)
+        zernike_scale_row.addWidget(self.hologram_scale_x_spin)
 
-        zernike_layout.addLayout(zernike_degree_row)
+        zernike_scale_row.addWidget(self.hologram_scale_optimize_x_checkbox)
+
+        zernike_scale_row.addSpacing(12)
+
+        zernike_scale_row.addWidget(self.hologram_scale_y_checkbox)
+
+        zernike_scale_row.addWidget(self.hologram_scale_y_spin)
+
+        zernike_scale_row.addWidget(self.hologram_scale_optimize_y_checkbox)
+
+        zernike_scale_row.addSpacing(8)
+
+        zernike_scale_row.addWidget(QLabel("Perturb:"))
+
+        zernike_scale_row.addWidget(self.hologram_scale_perturb_spin)
+
+        zernike_scale_row.addStretch(1)
+
+        zernike_layout.addLayout(zernike_scale_row)
+
+        zernike_shift_row = QHBoxLayout()
+
+        zernike_shift_row.addWidget(QLabel("Hologram position:"))
+
+        zernike_shift_row.addWidget(self.hologram_shift_x_checkbox)
+
+        zernike_shift_row.addWidget(self.hologram_shift_x_spin)
+
+        zernike_shift_row.addWidget(self.hologram_shift_optimize_x_checkbox)
+
+        zernike_shift_row.addSpacing(12)
+
+        zernike_shift_row.addWidget(self.hologram_shift_y_checkbox)
+
+        zernike_shift_row.addWidget(self.hologram_shift_y_spin)
+
+        zernike_shift_row.addWidget(self.hologram_shift_optimize_y_checkbox)
+
+        zernike_shift_row.addSpacing(8)
+
+        zernike_shift_row.addWidget(QLabel("Perturb:"))
+
+        zernike_shift_row.addWidget(self.hologram_shift_perturb_spin)
+
+        zernike_shift_row.addStretch(1)
+
+        zernike_layout.addLayout(zernike_shift_row)
+
+        zernike_layout.addWidget(self.hologram_scale_status_label)
 
         zernike_layout.addWidget(self.zernike_status_label)
 
@@ -1510,7 +1611,13 @@ class LiveCameraWindow(QMainWindow):
 
         zernike_controls_layout.setVerticalSpacing(6)
 
-        for row_idx, (n, m) in enumerate(self._zernike_terms):
+        zernike_controls_layout.addWidget(QLabel("Term"), 0, 0)
+
+        zernike_controls_layout.addWidget(QLabel("Coeff"), 0, 1)
+
+        zernike_controls_layout.addWidget(QLabel("Optimize"), 0, 2)
+
+        for row_idx, (n, m) in enumerate(self._zernike_terms, start=1):
 
             alias = self._zernike_alias(n, m)
 
@@ -1532,13 +1639,21 @@ class LiveCameraWindow(QMainWindow):
 
             spin.valueChanged.connect(self._on_zernike_coeff_changed)
 
+            optimize_check = QCheckBox()
+
+            optimize_check.setChecked(True)
+
             self._zernike_coeff_spins[(n, m)] = spin
 
-            self._zernike_row_widgets[(n, m)] = (label, spin)
+            self._zernike_optimize_checks[(n, m)] = optimize_check
+
+            self._zernike_row_widgets[(n, m)] = (label, spin, optimize_check)
 
             zernike_controls_layout.addWidget(label, row_idx, 0)
 
             zernike_controls_layout.addWidget(spin, row_idx, 1)
+
+            zernike_controls_layout.addWidget(optimize_check, row_idx, 2)
 
         zernike_controls_container.setLayout(zernike_controls_layout)
 
@@ -1666,22 +1781,6 @@ class LiveCameraWindow(QMainWindow):
 
         config_row.addStretch(1)
 
-        scale_row = QHBoxLayout()
-
-        scale_row.addWidget(QLabel("Hologram scaling:"))
-
-        scale_row.addWidget(self.hologram_scale_x_checkbox)
-
-        scale_row.addWidget(self.hologram_scale_x_spin)
-
-        scale_row.addSpacing(12)
-
-        scale_row.addWidget(self.hologram_scale_y_checkbox)
-
-        scale_row.addWidget(self.hologram_scale_y_spin)
-
-        scale_row.addStretch(1)
-
         control_row = QHBoxLayout()
 
         control_row.addWidget(self.pattern_start_button)
@@ -1694,13 +1793,9 @@ class LiveCameraWindow(QMainWindow):
 
         pattern_layout.addLayout(config_row)
 
-        pattern_layout.addLayout(scale_row)
-
         pattern_layout.addLayout(control_row)
 
         pattern_layout.addWidget(self.pattern_info_label)
-
-        pattern_layout.addWidget(self.hologram_scale_status_label)
 
         pattern_layout.addWidget(self.pattern_status_label)
 
@@ -2281,6 +2376,18 @@ class LiveCameraWindow(QMainWindow):
 
         self._hologram_scale_y_factor = 1.0
 
+        self._hologram_shift_x_enabled = False
+
+        self._hologram_shift_y_enabled = False
+
+        self._hologram_shift_x_px = 0
+
+        self._hologram_shift_y_px = 0
+
+        self._zernike_optimizer_scale_perturb = 0.05
+
+        self._zernike_optimizer_shift_perturb = 1.0
+
         self._zernike_phase_cache_shape: Optional[tuple[int, int]] = None
 
         self._zernike_phase_cache_coeffs: Optional[tuple[float, ...]] = None
@@ -2326,6 +2433,8 @@ class LiveCameraWindow(QMainWindow):
         self._channel_matrix_xt_db_diag: Optional[float] = None
 
         self._channel_matrix_xt_db_mode_group: Optional[float] = None
+
+        self._power_in_mode_groups: Optional[float] = None
 
         self._channel_matrix_dirty = False
 
@@ -2463,6 +2572,22 @@ class LiveCameraWindow(QMainWindow):
             self._on_hologram_scale_controls_changed
         )
 
+        self.hologram_shift_x_checkbox.toggled.connect(
+            self._on_hologram_position_controls_changed
+        )
+
+        self.hologram_shift_y_checkbox.toggled.connect(
+            self._on_hologram_position_controls_changed
+        )
+
+        self.hologram_shift_x_spin.valueChanged.connect(
+            self._on_hologram_position_controls_changed
+        )
+
+        self.hologram_shift_y_spin.valueChanged.connect(
+            self._on_hologram_position_controls_changed
+        )
+
         self.gaussian_mfd_checkbox.toggled.connect(self._on_gaussian_mfd_toggled)
 
         self.clipping_overlay_checkbox.toggled.connect(
@@ -2472,10 +2597,6 @@ class LiveCameraWindow(QMainWindow):
         self.zernike_reset_button.clicked.connect(self._reset_zernike_coefficients)
 
         self.zernike_load_button.clicked.connect(self._on_load_best_zernike_coefficients)
-
-        self.zernike_max_degree_combo.currentIndexChanged.connect(
-            self._on_zernike_degree_limit_changed
-        )
 
         self.zernike_opt_start_button.clicked.connect(self._start_zernike_optimizer)
 
@@ -2594,6 +2715,7 @@ class LiveCameraWindow(QMainWindow):
         self._on_grating_input_changed()
         self._on_focal_lens_input_changed()
         self._on_hologram_scale_controls_changed()
+        self._on_hologram_position_controls_changed()
         self._update_zernike_visibility()
         self._on_zernike_coeff_changed(0.0)
         self._update_phase_colorbar()
@@ -2770,24 +2892,60 @@ class LiveCameraWindow(QMainWindow):
 
         self._hologram_scale_y_factor = y_factor
 
+        self._update_hologram_transform_status()
+
+    def _on_hologram_position_controls_changed(self, _value=None) -> None:
+
+        x_enabled = bool(self.hologram_shift_x_checkbox.isChecked())
+
+        y_enabled = bool(self.hologram_shift_y_checkbox.isChecked())
+
+        self.hologram_shift_x_spin.setEnabled(x_enabled)
+
+        self.hologram_shift_y_spin.setEnabled(y_enabled)
+
+        x_shift_px = int(self.hologram_shift_x_spin.value())
+
+        y_shift_px = int(self.hologram_shift_y_spin.value())
+
+        self._hologram_shift_x_enabled = x_enabled
+
+        self._hologram_shift_y_enabled = y_enabled
+
+        self._hologram_shift_x_px = x_shift_px
+
+        self._hologram_shift_y_px = y_shift_px
+
+        self._update_hologram_transform_status()
+
+    def _update_hologram_transform_status(self) -> None:
+
         active_parts = []
 
-        if x_enabled:
+        if self._hologram_scale_x_enabled:
 
-            active_parts.append(f"X={x_factor:.3f}x")
+            active_parts.append(f"Scale X={self._hologram_scale_x_factor:.3f}x")
 
-        if y_enabled:
+        if self._hologram_scale_y_enabled:
 
-            active_parts.append(f"Y={y_factor:.3f}x")
+            active_parts.append(f"Scale Y={self._hologram_scale_y_factor:.3f}x")
+
+        if self._hologram_shift_x_enabled:
+
+            active_parts.append(f"Shift X={int(self._hologram_shift_x_px)} px")
+
+        if self._hologram_shift_y_enabled:
+
+            active_parts.append(f"Shift Y={int(self._hologram_shift_y_px)} px")
 
         if len(active_parts) <= 0:
 
-            self.hologram_scale_status_label.setText("Hologram scaling: off")
+            self.hologram_scale_status_label.setText("Hologram transform: off")
 
             return
 
         self.hologram_scale_status_label.setText(
-            "Hologram scaling: " + ", ".join(active_parts)
+            "Hologram transform: " + ", ".join(active_parts)
         )
 
     def _resample_image_bilinear(
@@ -2889,6 +3047,24 @@ class LiveCameraWindow(QMainWindow):
 
         return np.mod(scaled_phase, 2.0 * np.pi).astype(np.float32, copy=False)
 
+    def _apply_hologram_position(self, phase_map: np.ndarray) -> np.ndarray:
+
+        phase_f32 = np.asarray(phase_map, dtype=np.float32)
+
+        shift_x = int(self._hologram_shift_x_px) if self._hologram_shift_x_enabled else 0
+
+        shift_y = int(self._hologram_shift_y_px) if self._hologram_shift_y_enabled else 0
+
+        if shift_x == 0 and shift_y == 0:
+
+            return np.mod(phase_f32, 2.0 * np.pi).astype(np.float32, copy=False)
+
+        shifted = np.roll(phase_f32, shift=shift_y, axis=0)
+
+        shifted = np.roll(shifted, shift=shift_x, axis=1)
+
+        return np.mod(shifted, 2.0 * np.pi).astype(np.float32, copy=False)
+
     def _on_zernike_coeff_changed(self, _value: float) -> None:
 
         enabled_terms = self._get_enabled_zernike_terms()
@@ -2912,12 +3088,6 @@ class LiveCameraWindow(QMainWindow):
         self._zernike_phase_cache_coeffs = None
 
         self._zernike_phase_cache_map = None
-
-    def _on_zernike_degree_limit_changed(self, _index: int) -> None:
-
-        self._update_zernike_visibility()
-
-        self._on_zernike_coeff_changed(0.0)
 
     def _zernike_alias(self, n: int, m: int) -> str:
 
@@ -2949,33 +3119,38 @@ class LiveCameraWindow(QMainWindow):
 
     def _get_selected_zernike_max_degree(self) -> int:
 
-        value = self.zernike_max_degree_combo.currentData()
-
-        try:
-
-            return max(0, min(5, int(value)))
-
-        except Exception:
-
-            return 5
+        return 2
 
     def _get_enabled_zernike_terms(self) -> list[tuple[int, int]]:
 
-        max_degree = self._get_selected_zernike_max_degree()
+        return list(self._zernike_terms)
 
-        return [term for term in self._zernike_terms if term[0] <= max_degree]
+    def _get_optimizer_enabled_zernike_terms(self) -> list[tuple[int, int]]:
+        enabled_terms: list[tuple[int, int]] = []
+
+        for term in self._zernike_terms:
+
+            optimize_check = self._zernike_optimize_checks.get(term)
+
+            if optimize_check is None or not bool(optimize_check.isChecked()):
+
+                continue
+
+            enabled_terms.append(term)
+
+        return enabled_terms
 
     def _update_zernike_visibility(self) -> None:
 
-        max_degree = self._get_selected_zernike_max_degree()
+        for widgets in self._zernike_row_widgets.values():
 
-        for (n, _m), widgets in self._zernike_row_widgets.items():
+            widgets[0].setVisible(True)
 
-            visible = int(n) <= max_degree
+            widgets[1].setVisible(True)
 
-            widgets[0].setVisible(visible)
+            widgets[2].setVisible(True)
 
-            widgets[1].setVisible(visible)
+            widgets[2].setEnabled(True)
 
     def _reset_zernike_coefficients(self) -> None:
 
@@ -3068,7 +3243,7 @@ class LiveCameraWindow(QMainWindow):
 
             return False, f"Load failed: could not read file: {exc}"
 
-        coeffs_in_file, max_degree = self._parse_zernike_coefficients_text(text)
+        coeffs_in_file, _max_degree = self._parse_zernike_coefficients_text(text)
 
         if len(coeffs_in_file) <= 0:
 
@@ -3084,16 +3259,6 @@ class LiveCameraWindow(QMainWindow):
             spin.setValue(float(coeffs_in_file.get(term, 0.0)))
 
             spin.blockSignals(False)
-
-        if max_degree is not None:
-
-            max_degree_clamped = max(0, min(5, int(max_degree)))
-
-            combo_index = self.zernike_max_degree_combo.findData(max_degree_clamped)
-
-            if combo_index >= 0:
-
-                self.zernike_max_degree_combo.setCurrentIndex(combo_index)
 
         self._on_zernike_coeff_changed(0.0)
 
@@ -3226,15 +3391,137 @@ class LiveCameraWindow(QMainWindow):
 
             return
 
+        payload = coeffs
+
+        coeff_values: object = payload.get("zernike_coeffs")
+
+        if isinstance(coeff_values, dict):
+
+            coeff_dict = coeff_values
+
+        else:
+
+            coeff_dict = payload
+
         for term, spin in self._zernike_coeff_spins.items():
 
-            value = float(coeffs.get(term, spin.value()))
+            value = float(coeff_dict.get(term, spin.value()))
 
             spin.blockSignals(True)
 
             spin.setValue(max(-300.0, min(300.0, value)))
 
             spin.blockSignals(False)
+
+        if "hologram_scale_x_factor" in payload:
+
+            try:
+
+                x_factor = max(
+                    0.1,
+                    min(4.0, float(payload.get("hologram_scale_x_factor", 1.0))),
+                )
+
+                self.hologram_scale_x_checkbox.blockSignals(True)
+
+                self.hologram_scale_x_checkbox.setChecked(True)
+
+                self.hologram_scale_x_checkbox.blockSignals(False)
+
+                self.hologram_scale_x_spin.blockSignals(True)
+
+                self.hologram_scale_x_spin.setValue(x_factor)
+
+                self.hologram_scale_x_spin.blockSignals(False)
+
+            except Exception:
+
+                pass
+
+        if "hologram_scale_y_factor" in payload:
+
+            try:
+
+                y_factor = max(
+                    0.1,
+                    min(4.0, float(payload.get("hologram_scale_y_factor", 1.0))),
+                )
+
+                self.hologram_scale_y_checkbox.blockSignals(True)
+
+                self.hologram_scale_y_checkbox.setChecked(True)
+
+                self.hologram_scale_y_checkbox.blockSignals(False)
+
+                self.hologram_scale_y_spin.blockSignals(True)
+
+                self.hologram_scale_y_spin.setValue(y_factor)
+
+                self.hologram_scale_y_spin.blockSignals(False)
+
+            except Exception:
+
+                pass
+
+        if "hologram_shift_x_px" in payload:
+
+            try:
+
+                x_shift = int(
+                    np.clip(
+                        int(round(float(payload.get("hologram_shift_x_px", 0.0)))),
+                        int(self.hologram_shift_x_spin.minimum()),
+                        int(self.hologram_shift_x_spin.maximum()),
+                    )
+                )
+
+                self.hologram_shift_x_checkbox.blockSignals(True)
+
+                self.hologram_shift_x_checkbox.setChecked(True)
+
+                self.hologram_shift_x_checkbox.blockSignals(False)
+
+                self.hologram_shift_x_spin.blockSignals(True)
+
+                self.hologram_shift_x_spin.setValue(x_shift)
+
+                self.hologram_shift_x_spin.blockSignals(False)
+
+            except Exception:
+
+                pass
+
+        if "hologram_shift_y_px" in payload:
+
+            try:
+
+                y_shift = int(
+                    np.clip(
+                        int(round(float(payload.get("hologram_shift_y_px", 0.0)))),
+                        int(self.hologram_shift_y_spin.minimum()),
+                        int(self.hologram_shift_y_spin.maximum()),
+                    )
+                )
+
+                self.hologram_shift_y_checkbox.blockSignals(True)
+
+                self.hologram_shift_y_checkbox.setChecked(True)
+
+                self.hologram_shift_y_checkbox.blockSignals(False)
+
+                self.hologram_shift_y_spin.blockSignals(True)
+
+                self.hologram_shift_y_spin.setValue(y_shift)
+
+                self.hologram_shift_y_spin.blockSignals(False)
+
+            except Exception:
+
+                pass
+
+        self._on_hologram_scale_controls_changed()
+
+        self._on_hologram_position_controls_changed()
 
         self._on_zernike_coeff_changed(0.0)
 
@@ -3293,6 +3580,66 @@ class LiveCameraWindow(QMainWindow):
 
         return coeff_dict
 
+    def _build_optimizer_apply_payload(
+        self,
+        enabled_terms: list[tuple[int, int]],
+        coeff_vector: np.ndarray,
+    ) -> dict[str, object]:
+
+        payload: dict[str, object] = {
+            "zernike_coeffs": self._coeff_vector_to_dict(enabled_terms, coeff_vector)
+        }
+
+        idx = len(enabled_terms)
+
+        if bool(getattr(self, "_zernike_optimizer_optimize_scale_x", False)):
+
+            if idx < int(coeff_vector.shape[0]):
+
+                payload["hologram_scale_x_factor"] = float(
+                    np.clip(coeff_vector[idx], 0.1, 4.0)
+                )
+
+            idx += 1
+
+        if bool(getattr(self, "_zernike_optimizer_optimize_scale_y", False)):
+
+            if idx < int(coeff_vector.shape[0]):
+
+                payload["hologram_scale_y_factor"] = float(
+                    np.clip(coeff_vector[idx], 0.1, 4.0)
+                )
+
+            idx += 1
+
+        if bool(getattr(self, "_zernike_optimizer_optimize_shift_x", False)):
+
+            if idx < int(coeff_vector.shape[0]):
+
+                payload["hologram_shift_x_px"] = float(
+                    np.clip(
+                        coeff_vector[idx],
+                        -10000.0,
+                        10000.0,
+                    )
+                )
+
+            idx += 1
+
+        if bool(getattr(self, "_zernike_optimizer_optimize_shift_y", False)):
+
+            if idx < int(coeff_vector.shape[0]):
+
+                payload["hologram_shift_y_px"] = float(
+                    np.clip(
+                        coeff_vector[idx],
+                        -10000.0,
+                        10000.0,
+                    )
+                )
+
+        return payload
+
     def _evaluate_zernike_optimizer_candidate(
         self,
         enabled_terms: list[tuple[int, int]],
@@ -3303,7 +3650,7 @@ class LiveCameraWindow(QMainWindow):
     ) -> Optional[tuple[int, float]]:
 
         self.zernike_coefficients_apply_requested.emit(
-            self._coeff_vector_to_dict(enabled_terms, coeff_vector)
+            self._build_optimizer_apply_payload(enabled_terms, coeff_vector)
         )
 
         return self._wait_for_next_loop_xt_metric(
@@ -3329,13 +3676,56 @@ class LiveCameraWindow(QMainWindow):
 
             return
 
-        enabled_terms = self._get_enabled_zernike_terms()
+        enabled_terms = self._get_optimizer_enabled_zernike_terms()
 
-        if len(enabled_terms) <= 0:
+        optimize_scale_x = bool(self.hologram_scale_optimize_x_checkbox.isChecked())
 
-            self._set_zernike_optimizer_status("Optimizer: no enabled Zernike terms")
+        optimize_scale_y = bool(self.hologram_scale_optimize_y_checkbox.isChecked())
+
+        optimize_shift_x = bool(self.hologram_shift_optimize_x_checkbox.isChecked())
+
+        optimize_shift_y = bool(self.hologram_shift_optimize_y_checkbox.isChecked())
+
+        if optimize_scale_x and not bool(self.hologram_scale_x_checkbox.isChecked()):
+
+            self.hologram_scale_x_checkbox.setChecked(True)
+
+        if optimize_scale_y and not bool(self.hologram_scale_y_checkbox.isChecked()):
+
+            self.hologram_scale_y_checkbox.setChecked(True)
+
+        if optimize_shift_x and not bool(self.hologram_shift_x_checkbox.isChecked()):
+
+            self.hologram_shift_x_checkbox.setChecked(True)
+
+        if optimize_shift_y and not bool(self.hologram_shift_y_checkbox.isChecked()):
+
+            self.hologram_shift_y_checkbox.setChecked(True)
+
+        self._on_hologram_scale_controls_changed()
+
+        self._on_hologram_position_controls_changed()
+
+        if len(enabled_terms) <= 0 and not (
+            optimize_scale_x
+            or optimize_scale_y
+            or optimize_shift_x
+            or optimize_shift_y
+        ):
+
+            self._set_zernike_optimizer_status(
+                "Optimizer: select at least one n<=2 Zernike optimize toggle or transform optimize toggle"
+            )
 
             return
+
+        self._zernike_optimizer_optimize_scale_x = optimize_scale_x
+
+        self._zernike_optimizer_optimize_scale_y = optimize_scale_y
+
+        self._zernike_optimizer_optimize_shift_x = optimize_shift_x
+
+        self._zernike_optimizer_optimize_shift_y = optimize_shift_y
 
         iterations = int(self.zernike_opt_iterations_spin.value())
 
@@ -3343,7 +3733,15 @@ class LiveCameraWindow(QMainWindow):
 
         perturbation = float(self.zernike_opt_perturb_spin.value())
 
-        max_degree = self._get_selected_zernike_max_degree()
+        self._zernike_optimizer_scale_perturb = max(
+            1e-5, float(self.hologram_scale_perturb_spin.value())
+        )
+
+        self._zernike_optimizer_shift_perturb = max(
+            1e-5, float(self.hologram_shift_perturb_spin.value())
+        )
+
+        max_degree = min(2, self._get_selected_zernike_max_degree())
 
         optimizer_algorithm = str(
             self.zernike_opt_algorithm_combo.currentData()
@@ -3449,6 +3847,120 @@ class LiveCameraWindow(QMainWindow):
 
         try:
 
+            optimize_scale_x = bool(
+                getattr(self, "_zernike_optimizer_optimize_scale_x", False)
+            )
+
+            optimize_scale_y = bool(
+                getattr(self, "_zernike_optimizer_optimize_scale_y", False)
+            )
+
+            optimize_shift_x = bool(
+                getattr(self, "_zernike_optimizer_optimize_shift_x", False)
+            )
+
+            optimize_shift_y = bool(
+                getattr(self, "_zernike_optimizer_optimize_shift_y", False)
+            )
+
+            shift_x_min = -10000.0
+
+            shift_x_max = 10000.0
+
+            shift_y_min = -10000.0
+
+            shift_y_max = 10000.0
+
+            n_term_dims = len(enabled_terms)
+
+            def _clip_theta(vec: np.ndarray) -> np.ndarray:
+
+                clipped = np.asarray(vec, dtype=np.float64).copy()
+
+                if n_term_dims > 0:
+
+                    clipped[:n_term_dims] = np.clip(
+                        clipped[:n_term_dims], -300.0, 300.0
+                    )
+
+                idx_local = n_term_dims
+
+                if optimize_scale_x:
+
+                    if idx_local < int(clipped.shape[0]):
+
+                        clipped[idx_local] = float(np.clip(clipped[idx_local], 0.1, 4.0))
+
+                    idx_local += 1
+
+                if optimize_scale_y:
+
+                    if idx_local < int(clipped.shape[0]):
+
+                        clipped[idx_local] = float(np.clip(clipped[idx_local], 0.1, 4.0))
+
+                    idx_local += 1
+
+                if optimize_shift_x:
+
+                    if idx_local < int(clipped.shape[0]):
+
+                        clipped[idx_local] = float(
+                            np.clip(clipped[idx_local], shift_x_min, shift_x_max)
+                        )
+
+                    idx_local += 1
+
+                if optimize_shift_y:
+
+                    if idx_local < int(clipped.shape[0]):
+
+                        clipped[idx_local] = float(
+                            np.clip(clipped[idx_local], shift_y_min, shift_y_max)
+                        )
+
+                return clipped
+
+            def _clip_component(value: float, dim_index: int) -> float:
+
+                if dim_index < n_term_dims:
+
+                    return float(np.clip(value, -300.0, 300.0))
+
+                offset = dim_index - n_term_dims
+
+                if optimize_scale_x:
+
+                    if offset == 0:
+
+                        return float(np.clip(value, 0.1, 4.0))
+
+                    offset -= 1
+
+                if optimize_scale_y:
+
+                    if offset == 0:
+
+                        return float(np.clip(value, 0.1, 4.0))
+
+                    offset -= 1
+
+                if optimize_shift_x:
+
+                    if offset == 0:
+
+                        return float(np.clip(value, shift_x_min, shift_x_max))
+
+                    offset -= 1
+
+                if optimize_shift_y:
+
+                    if offset == 0:
+
+                        return float(np.clip(value, shift_y_min, shift_y_max))
+
+                return float(np.clip(value, -300.0, 300.0))
+
             history_path_text = str(history_path).strip()
 
             if history_path_text == "":
@@ -3483,6 +3995,22 @@ class LiveCameraWindow(QMainWindow):
 
             term_columns = [f"Z({n},{m})" for (n, m) in enabled_terms]
 
+            if optimize_scale_x:
+
+                term_columns.append("hologram_scale_x")
+
+            if optimize_scale_y:
+
+                term_columns.append("hologram_scale_y")
+
+            if optimize_shift_x:
+
+                term_columns.append("hologram_shift_x_px")
+
+            if optimize_shift_y:
+
+                term_columns.append("hologram_shift_y_px")
+
             csv_columns = [
                 "timestamp_iso",
                 "iteration",
@@ -3499,10 +4027,25 @@ class LiveCameraWindow(QMainWindow):
                 "xt_source",
             ] + term_columns
 
-            theta = np.array(
-                [float(initial_coeffs.get(term, 0.0)) for term in enabled_terms],
-                dtype=np.float64,
-            )
+            theta_values = [float(initial_coeffs.get(term, 0.0)) for term in enabled_terms]
+
+            if optimize_scale_x:
+
+                theta_values.append(float(getattr(self, "_hologram_scale_x_factor", 1.0)))
+
+            if optimize_scale_y:
+
+                theta_values.append(float(getattr(self, "_hologram_scale_y_factor", 1.0)))
+
+            if optimize_shift_x:
+
+                theta_values.append(float(getattr(self, "_hologram_shift_x_px", 0)))
+
+            if optimize_shift_y:
+
+                theta_values.append(float(getattr(self, "_hologram_shift_y_px", 0)))
+
+            theta = _clip_theta(np.array(theta_values, dtype=np.float64))
 
             m = np.zeros_like(theta)
 
@@ -3516,7 +4059,43 @@ class LiveCameraWindow(QMainWindow):
 
             a0 = max(1e-5, float(learning_rate))
 
-            c0 = max(1e-5, float(perturbation))
+            c0_zernike = max(1e-5, float(perturbation))
+
+            c0_scale = max(
+                1e-5,
+                float(getattr(self, "_zernike_optimizer_scale_perturb", c0_zernike)),
+            )
+
+            c0_shift = max(
+                1e-5,
+                float(getattr(self, "_zernike_optimizer_shift_perturb", 1.0)),
+            )
+
+            c0_vec_values: list[float] = [c0_zernike] * int(n_term_dims)
+
+            if optimize_scale_x:
+
+                c0_vec_values.append(c0_scale)
+
+            if optimize_scale_y:
+
+                c0_vec_values.append(c0_scale)
+
+            if optimize_shift_x:
+
+                c0_vec_values.append(c0_shift)
+
+            if optimize_shift_y:
+
+                c0_vec_values.append(c0_shift)
+
+            c0_vec = np.asarray(c0_vec_values, dtype=np.float64)
+
+            if int(c0_vec.shape[0]) != int(theta.shape[0]):
+
+                c0_vec = np.full(theta.shape[0], c0_zernike, dtype=np.float64)
+
+            c0_vec = np.maximum(c0_vec, 1e-5)
 
             best_theta = np.array(theta, copy=True)
 
@@ -3618,12 +4197,13 @@ class LiveCameraWindow(QMainWindow):
                         np.float64, copy=False
                     )
 
-                    nm_step = max(1e-5, float(c0))
+                    nm_step_vec = np.maximum(c0_vec, 1e-5)
 
                     for dim in range(n_dims):
 
-                        simplex[dim + 1, dim] = float(
-                            np.clip(simplex[dim + 1, dim] + nm_step, -300.0, 300.0)
+                        simplex[dim + 1, dim] = _clip_component(
+                            float(simplex[dim + 1, dim] + nm_step_vec[dim]),
+                            dim,
                         )
 
                     values = np.full(n_dims + 1, np.inf, dtype=np.float64)
@@ -3699,7 +4279,7 @@ class LiveCameraWindow(QMainWindow):
 
                         phase_label = "reflect"
 
-                        xr = np.clip(centroid + alpha * (centroid - worst), -300.0, 300.0)
+                        xr = _clip_theta(centroid + alpha * (centroid - worst))
 
                         metric_reflect = self._evaluate_zernike_optimizer_candidate(
                             enabled_terms,
@@ -3722,9 +4302,7 @@ class LiveCameraWindow(QMainWindow):
 
                         if float(fr) < best_value:
 
-                            xe = np.clip(
-                                centroid + gamma * (xr - centroid), -300.0, 300.0
-                            )
+                            xe = _clip_theta(centroid + gamma * (xr - centroid))
 
                             metric_expand = self._evaluate_zernike_optimizer_candidate(
                                 enabled_terms,
@@ -3775,9 +4353,7 @@ class LiveCameraWindow(QMainWindow):
 
                             if float(fr) < worst_value:
 
-                                xc = np.clip(
-                                    centroid + rho * (xr - centroid), -300.0, 300.0
-                                )
+                                xc = _clip_theta(centroid + rho * (xr - centroid))
 
                                 metric_contract_out = self._evaluate_zernike_optimizer_candidate(
                                     enabled_terms,
@@ -3812,9 +4388,7 @@ class LiveCameraWindow(QMainWindow):
 
                             else:
 
-                                xc = np.clip(
-                                    centroid - rho * (centroid - worst), -300.0, 300.0
-                                )
+                                xc = _clip_theta(centroid - rho * (centroid - worst))
 
                                 metric_contract_in = self._evaluate_zernike_optimizer_candidate(
                                     enabled_terms,
@@ -3853,11 +4427,9 @@ class LiveCameraWindow(QMainWindow):
 
                                 for vertex_idx in range(1, n_dims + 1):
 
-                                    simplex[vertex_idx] = np.clip(
+                                    simplex[vertex_idx] = _clip_theta(
                                         best_vertex
-                                        + sigma * (simplex[vertex_idx] - best_vertex),
-                                        -300.0,
-                                        300.0,
+                                        + sigma * (simplex[vertex_idx] - best_vertex)
                                     )
 
                                     metric_shrink = self._evaluate_zernike_optimizer_candidate(
@@ -3908,7 +4480,7 @@ class LiveCameraWindow(QMainWindow):
                             None,
                             None,
                             0.0,
-                            float(nm_step),
+                            float(np.mean(nm_step_vec)),
                             0.0,
                             current_best_theta,
                         )
@@ -3919,7 +4491,7 @@ class LiveCameraWindow(QMainWindow):
 
                 elif optimizer_algorithm == "stochastic_hill_climb":
 
-                    step_now = max(1e-5, float(c0))
+                    step_now = np.maximum(c0_vec.copy(), 1e-5)
 
                     for it in range(1, int(iterations) + 1):
 
@@ -3931,11 +4503,10 @@ class LiveCameraWindow(QMainWindow):
 
                             return
 
-                        candidate_theta = np.clip(
+                        candidate_theta = _clip_theta(
                             best_theta
-                            + local_rng.normal(0.0, step_now, size=best_theta.shape),
-                            -300.0,
-                            300.0,
+                            + local_rng.normal(0.0, 1.0, size=best_theta.shape)
+                            * step_now
                         )
 
                         metric_candidate = self._evaluate_zernike_optimizer_candidate(
@@ -3965,7 +4536,7 @@ class LiveCameraWindow(QMainWindow):
 
                             best_theta = np.array(candidate_theta, copy=True)
 
-                            step_now = max(1e-5, step_now * 1.03)
+                            step_now = np.maximum(1e-5, step_now * 1.03)
 
                             phase_label = "accept"
 
@@ -3975,7 +4546,7 @@ class LiveCameraWindow(QMainWindow):
 
                         else:
 
-                            step_now = max(1e-5, step_now * 0.97)
+                            step_now = np.maximum(1e-5, step_now * 0.97)
 
                             phase_label = "reject"
 
@@ -3992,7 +4563,7 @@ class LiveCameraWindow(QMainWindow):
                             None,
                             None,
                             float(a0),
-                            float(step_now),
+                            float(np.mean(step_now)),
                             0.0,
                             candidate_theta,
                         )
@@ -4021,11 +4592,14 @@ class LiveCameraWindow(QMainWindow):
 
                         ak = a0 / math.pow(float(it) + 9.0, 0.602)
 
-                        ck = c0 / math.pow(float(it), 0.101)
+                        ck_vec = np.maximum(
+                            1e-5,
+                            c0_vec / math.pow(float(it), 0.101),
+                        )
 
                         delta = local_rng.choice([-1.0, 1.0], size=theta.shape[0])
 
-                        theta_plus = np.clip(theta + ck * delta, -300.0, 300.0)
+                        theta_plus = _clip_theta(theta + ck_vec * delta)
 
                         metric_plus = self._evaluate_zernike_optimizer_candidate(
                             enabled_terms,
@@ -4045,7 +4619,7 @@ class LiveCameraWindow(QMainWindow):
 
                         last_loop, xt_plus_db = metric_plus
 
-                        theta_minus = np.clip(theta - ck * delta, -300.0, 300.0)
+                        theta_minus = _clip_theta(theta - ck_vec * delta)
 
                         metric_minus = self._evaluate_zernike_optimizer_candidate(
                             enabled_terms,
@@ -4065,11 +4639,11 @@ class LiveCameraWindow(QMainWindow):
 
                         last_loop, xt_minus_db = metric_minus
 
-                        grad_scale = (float(xt_plus_db) - float(xt_minus_db)) / (
-                            2.0 * max(1e-8, float(ck))
+                        grad = (
+                            (float(xt_plus_db) - float(xt_minus_db))
+                            * delta
+                            / (2.0 * np.maximum(1e-8, ck_vec))
                         )
-
-                        grad = grad_scale * delta
 
                         m = beta1 * m + (1.0 - beta1) * grad
 
@@ -4079,10 +4653,8 @@ class LiveCameraWindow(QMainWindow):
 
                         v_hat = v / (1.0 - math.pow(beta2, float(it)))
 
-                        theta = np.clip(
+                        theta = _clip_theta(
                             theta - float(ak) * (m_hat / (np.sqrt(v_hat) + eps)),
-                            -300.0,
-                            300.0,
                         )
 
                         metric_current = self._evaluate_zernike_optimizer_candidate(
@@ -4121,7 +4693,7 @@ class LiveCameraWindow(QMainWindow):
                             float(xt_plus_db),
                             float(xt_minus_db),
                             float(ak),
-                            float(ck),
+                            float(np.mean(ck_vec)),
                             float(grad_norm),
                             theta,
                         )
@@ -4132,7 +4704,9 @@ class LiveCameraWindow(QMainWindow):
 
             best_coeffs = self._coeff_vector_to_dict(enabled_terms, best_theta)
 
-            self.zernike_coefficients_apply_requested.emit(best_coeffs)
+            self.zernike_coefficients_apply_requested.emit(
+                self._build_optimizer_apply_payload(enabled_terms, best_theta)
+            )
 
             saved_ok, save_info = self._save_zernike_coefficients_to_text(
                 best_coeffs,
@@ -9526,7 +10100,9 @@ class LiveCameraWindow(QMainWindow):
                             + zernike_phase,
                             2.0 * np.pi,
                         )
-                        return self._apply_hologram_scaling(composed)
+                        return self._apply_hologram_position(
+                            self._apply_hologram_scaling(composed)
+                        )
 
                     composed = np.mod(
                         base_phase
@@ -9536,7 +10112,9 @@ class LiveCameraWindow(QMainWindow):
                         + phase_correction,
                         2.0 * np.pi,
                     )
-                    return self._apply_hologram_scaling(composed)
+                    return self._apply_hologram_position(
+                        self._apply_hologram_scaling(composed)
+                    )
 
                 def loop_callback() -> None:
                     nonlocal frame_idx, last_update, cached_periods, cached_ramp

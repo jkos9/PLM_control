@@ -1,0 +1,11 @@
+timestamp_iso=2026-04-21T15:24:09.552570
+best_xt_db=-12.300707
+max_radial_degree=2
+enabled_terms_count=5
+
+Z(0,0)=+0.000000 # Piston
+Z(1,-1)=-0.721645 # Tilt Y
+Z(1,1)=+0.423297 # Tilt X
+Z(2,-2)=-0.237380 # Astigmatism 45°
+Z(2,0)=+0.083792 # Defocus
+Z(2,2)=+0.038129 # Astigmatism 0°
