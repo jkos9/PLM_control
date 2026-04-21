@@ -1376,6 +1376,12 @@ class LiveCameraWindow(QMainWindow):
 
         self.channel_matrix_xt_label = QLabel("XT diag/mode-group (dB): n/a / n/a")
 
+        self.channel_matrix_scale_linear_checkbox = QCheckBox(
+            "Plot linear scale (relative power)"
+        )
+
+        self.channel_matrix_scale_linear_checkbox.setChecked(False)
+
         self.channel_matrix_save_checkbox = QCheckBox(
             "Save channel matrix each completed loop"
         )
@@ -1393,6 +1399,8 @@ class LiveCameraWindow(QMainWindow):
         channel_matrix_layout.addWidget(self.channel_matrix_status_label)
 
         channel_matrix_layout.addWidget(self.channel_matrix_xt_label)
+
+        channel_matrix_layout.addWidget(self.channel_matrix_scale_linear_checkbox)
 
         save_row = QHBoxLayout()
 
@@ -1431,6 +1439,22 @@ class LiveCameraWindow(QMainWindow):
         svd_layout.addWidget(self.svd_canvas, 1)
 
         svd_tab.setLayout(svd_layout)
+
+        mfd_tab = QWidget()
+
+        mfd_layout = QVBoxLayout()
+
+        self.mfd_plot_status_label = QLabel(
+            "MFD profiles: enable Gaussian MFD to view live profile fits."
+        )
+
+        self.mfd_canvas = FigureCanvas(Figure(figsize=(5.0, 4.2)))
+
+        mfd_layout.addWidget(self.mfd_plot_status_label)
+
+        mfd_layout.addWidget(self.mfd_canvas, 1)
+
+        mfd_tab.setLayout(mfd_layout)
 
         phase_plot_tab = QWidget()
 
@@ -2002,13 +2026,21 @@ class LiveCameraWindow(QMainWindow):
 
         self.right_tab_widget = QTabWidget()
 
-        self.right_tab_widget.addTab(recovered_tab, "Recovered Field")
+        self._right_tab_index_recovered = self.right_tab_widget.addTab(
+            recovered_tab, "Recovered Field"
+        )
 
-        self.right_tab_widget.addTab(pattern_gallery_tab, "Pattern Gallery")
+        self._right_tab_index_pattern_gallery = self.right_tab_widget.addTab(
+            pattern_gallery_tab, "Pattern Gallery"
+        )
 
-        self.right_tab_widget.addTab(channel_matrix_tab, "Channel Matrix")
+        self._right_tab_index_channel_matrix = self.right_tab_widget.addTab(
+            channel_matrix_tab, "Channel Matrix"
+        )
 
-        self.right_tab_widget.addTab(svd_tab, "SVD")
+        self._right_tab_index_svd = self.right_tab_widget.addTab(svd_tab, "SVD")
+
+        self._right_tab_index_mfd = self.right_tab_widget.addTab(mfd_tab, "MFD")
 
         controls = QHBoxLayout()
 
@@ -2297,6 +2329,8 @@ class LiveCameraWindow(QMainWindow):
 
         self._channel_matrix_dirty = False
 
+        self._channel_matrix_plot_linear = False
+
         self._channel_matrix_loop_history: list[np.ndarray] = []
 
         self._channel_matrix_xt_history_db: list[float] = []
@@ -2332,6 +2366,22 @@ class LiveCameraWindow(QMainWindow):
         self._gaussian_pixel_pitch_um = 15.0
 
         self._gaussian_mfd_enabled = False
+
+        self._mfd_profile_x_samples: Optional[np.ndarray] = None
+
+        self._mfd_profile_y_samples: Optional[np.ndarray] = None
+
+        self._mfd_profile_x_fit: Optional[np.ndarray] = None
+
+        self._mfd_profile_y_fit: Optional[np.ndarray] = None
+
+        self._mfd_profile_source_name = "n/a"
+
+        self._mfd_profile_x_params = "X fit: n/a"
+
+        self._mfd_profile_y_params = "Y fit: n/a"
+
+        self._mfd_plot_dirty = True
 
         self._clipping_overlay_threshold_dn = 16383
 
@@ -2465,6 +2515,10 @@ class LiveCameraWindow(QMainWindow):
             self._on_save_channel_matrix_now
         )
 
+        self.channel_matrix_scale_linear_checkbox.toggled.connect(
+            self._on_channel_matrix_scale_toggled
+        )
+
         self.pattern_fields_save_browse_button.clicked.connect(
             self._on_browse_pattern_fields_save_file
         )
@@ -2570,12 +2624,21 @@ class LiveCameraWindow(QMainWindow):
         self._refresh_phase_calibration_live_pattern_plot(None)
         self._load_default_target_modes()
         self._refresh_channel_matrix_plot(force=True)
+        self._refresh_mfd_plot(force=True)
 
     def _on_left_tab_changed(self, _index: int) -> None:
         self._refresh_plots_if_dirty(force=True)
 
     def _on_right_tab_changed(self, _index: int) -> None:
         self._refresh_plots_if_dirty(force=True)
+
+    def _on_channel_matrix_scale_toggled(self, checked: bool) -> None:
+
+        self._channel_matrix_plot_linear = bool(checked)
+
+        self._channel_matrix_dirty = True
+
+        self._refresh_channel_matrix_plot(force=True)
 
     def _on_colormap_toggled(self, _checked: bool) -> None:
 
@@ -4154,19 +4217,51 @@ class LiveCameraWindow(QMainWindow):
             for (n, m) in self._zernike_terms
         )
 
+        pitch_x_m = float(self._plm_pixel_pitch_x_m)
+        pitch_y_m = float(self._plm_pixel_pitch_y_m)
+
+        if pitch_x_m <= 0.0:
+
+            pitch_x_m = 16.2e-6
+
+        if pitch_y_m <= 0.0:
+
+            pitch_y_m = 10.8e-6
+
+        cache_key = (
+            max_degree,
+            round(float(pitch_x_m), 12),
+            round(float(pitch_y_m), 12),
+            *coeff_values,
+        )
+
         if (
             self._zernike_phase_cache_map is not None
             and self._zernike_phase_cache_shape == (height, width)
-            and self._zernike_phase_cache_coeffs == (max_degree, *coeff_values)
+            and self._zernike_phase_cache_coeffs == cache_key
         ):
 
             return self._zernike_phase_cache_map
 
-        y = np.linspace(-1.0, 1.0, height, dtype=np.float32)
+        x_m = (np.arange(width, dtype=np.float32) - 0.5 * float(width - 1)) * float(
+            pitch_x_m
+        )
 
-        x = np.linspace(-1.0, 1.0, width, dtype=np.float32)
+        y_m = (np.arange(height, dtype=np.float32) - 0.5 * float(height - 1)) * float(
+            pitch_y_m
+        )
 
-        yy, xx = np.meshgrid(y, x, indexing="ij")
+        yy_m, xx_m = np.meshgrid(y_m, x_m, indexing="ij")
+
+        half_extent_x = float(np.max(np.abs(x_m))) if width > 0 else 0.0
+
+        half_extent_y = float(np.max(np.abs(y_m))) if height > 0 else 0.0
+
+        aperture_radius_m = max(1e-12, min(half_extent_x, half_extent_y))
+
+        xx = xx_m / float(aperture_radius_m)
+
+        yy = yy_m / float(aperture_radius_m)
 
         r = np.sqrt(xx * xx + yy * yy)
 
@@ -4214,7 +4309,7 @@ class LiveCameraWindow(QMainWindow):
 
         self._zernike_phase_cache_shape = (height, width)
 
-        self._zernike_phase_cache_coeffs = (max_degree, *coeff_values)
+        self._zernike_phase_cache_coeffs = cache_key
 
         self._zernike_phase_cache_map = phase
 
@@ -5262,7 +5357,10 @@ class LiveCameraWindow(QMainWindow):
 
             return
 
-        if not (force or self.right_tab_widget.currentIndex() == 3):
+        if not (
+            force
+            or self.right_tab_widget.currentIndex() == self._right_tab_index_svd
+        ):
 
             return
 
@@ -5381,6 +5479,145 @@ class LiveCameraWindow(QMainWindow):
         self.svd_canvas.draw_idle()
 
         self._svd_dirty = False
+
+    def _refresh_mfd_plot(self, force: bool = False) -> None:
+
+        if not (force or self._mfd_plot_dirty):
+
+            return
+
+        if not (
+            force
+            or self.right_tab_widget.currentIndex() == self._right_tab_index_mfd
+        ):
+
+            return
+
+        fig = self.mfd_canvas.figure
+
+        fig.clear()
+
+        if (
+            not self._gaussian_mfd_enabled
+            or self._mfd_profile_x_samples is None
+            or self._mfd_profile_y_samples is None
+        ):
+
+            ax = fig.add_subplot(111)
+
+            ax.set_title("Gaussian MFD Profiles")
+
+            ax.text(
+                0.5,
+                0.5,
+                "Enable Gaussian MFD and wait for frames",
+                ha="center",
+                va="center",
+            )
+
+            ax.set_axis_off()
+
+            self.mfd_plot_status_label.setText(
+                "MFD profiles: enable Gaussian MFD to view live profile fits."
+            )
+
+            fig.tight_layout()
+
+            self.mfd_canvas.draw_idle()
+
+            self._mfd_plot_dirty = False
+
+            return
+
+        ax_x = fig.add_subplot(211)
+
+        x_samples = np.asarray(self._mfd_profile_x_samples, dtype=np.float64)
+
+        x_idx = np.arange(x_samples.size, dtype=np.int32)
+
+        ax_x.plot(x_idx, x_samples, color="tab:blue", linewidth=1.2, label="measured")
+
+        if self._mfd_profile_x_fit is not None:
+
+            ax_x.plot(
+                x_idx,
+                np.asarray(self._mfd_profile_x_fit, dtype=np.float64),
+                color="tab:orange",
+                linewidth=1.2,
+                linestyle="--",
+                label="gaussian fit",
+            )
+
+        ax_x.set_title("MFD X Profile")
+
+        ax_x.set_xlabel("X pixel")
+
+        ax_x.set_ylabel("Intensity (DN)")
+
+        ax_x.grid(True, alpha=0.3)
+
+        ax_x.legend(loc="upper right", fontsize=8)
+
+        ax_x.text(
+            0.01,
+            0.99,
+            self._mfd_profile_x_params,
+            transform=ax_x.transAxes,
+            va="top",
+            ha="left",
+            fontsize=8,
+            bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+        )
+
+        ax_y = fig.add_subplot(212)
+
+        y_samples = np.asarray(self._mfd_profile_y_samples, dtype=np.float64)
+
+        y_idx = np.arange(y_samples.size, dtype=np.int32)
+
+        ax_y.plot(y_idx, y_samples, color="tab:green", linewidth=1.2, label="measured")
+
+        if self._mfd_profile_y_fit is not None:
+
+            ax_y.plot(
+                y_idx,
+                np.asarray(self._mfd_profile_y_fit, dtype=np.float64),
+                color="tab:red",
+                linewidth=1.2,
+                linestyle="--",
+                label="gaussian fit",
+            )
+
+        ax_y.set_title("MFD Y Profile")
+
+        ax_y.set_xlabel("Y pixel")
+
+        ax_y.set_ylabel("Intensity (DN)")
+
+        ax_y.grid(True, alpha=0.3)
+
+        ax_y.legend(loc="upper right", fontsize=8)
+
+        ax_y.text(
+            0.01,
+            0.99,
+            self._mfd_profile_y_params,
+            transform=ax_y.transAxes,
+            va="top",
+            ha="left",
+            fontsize=8,
+            bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+        )
+
+        self.mfd_plot_status_label.setText(
+            f"MFD profiles source: {self._mfd_profile_source_name}"
+        )
+
+        fig.tight_layout()
+
+        self.mfd_canvas.draw_idle()
+
+        self._mfd_plot_dirty = False
 
     def _on_browse_channel_matrix_save_file(self) -> None:
 
@@ -5574,7 +5811,10 @@ class LiveCameraWindow(QMainWindow):
 
             return
 
-        if not (force or self.right_tab_widget.currentIndex() == 2):
+        if not (
+            force
+            or self.right_tab_widget.currentIndex() == self._right_tab_index_channel_matrix
+        ):
 
             return
 
@@ -5604,21 +5844,35 @@ class LiveCameraWindow(QMainWindow):
 
         power_linear = np.abs(self._channel_matrix) ** 2
 
-        power_mw_rel = power_linear / (float(np.max(power_linear)) + 1e-12)
+        power_rel = power_linear / (float(np.max(power_linear)) + 1e-12)
 
-        power_dbm_rel = 10.0 * np.log10(np.maximum(power_mw_rel, 1e-12))
-
-        power_floor_dbm = -40.0
+        use_linear_scale = bool(self._channel_matrix_plot_linear)
 
         ax_amp = fig.add_subplot(111)
 
-        im_amp = ax_amp.imshow(
-            power_dbm_rel,
-            cmap=self._phase_colormap_name,
-            vmin=power_floor_dbm,
-            vmax=0.0,
-            aspect="equal",
-        )
+        if use_linear_scale:
+
+            im_amp = ax_amp.imshow(
+                power_rel,
+                cmap=self._phase_colormap_name,
+                vmin=0.0,
+                vmax=1.0,
+                aspect="equal",
+            )
+
+        else:
+
+            power_dbm_rel = 10.0 * np.log10(np.maximum(power_rel, 1e-12))
+
+            power_floor_dbm = -40.0
+
+            im_amp = ax_amp.imshow(
+                power_dbm_rel,
+                cmap=self._phase_colormap_name,
+                vmin=power_floor_dbm,
+                vmax=0.0,
+                aspect="equal",
+            )
 
         ax_amp.set_box_aspect(1)
 
@@ -5634,23 +5888,31 @@ class LiveCameraWindow(QMainWindow):
             else f"{self._channel_matrix_xt_db_mode_group:.3f}"
         )
 
-        ax_amp.set_title(
-            f"Channel Matrix Intensity (dBm rel) | XT diag/mode-group={diag_text}/{mode_group_text} dB"
-        )
+        if use_linear_scale:
+
+            ax_amp.set_title(
+                f"Channel Matrix Intensity (linear rel) | XT diag/mode-group={diag_text}/{mode_group_text} dB"
+            )
+
+        else:
+
+            ax_amp.set_title(
+                f"Channel Matrix Intensity (dBm rel) | XT diag/mode-group={diag_text}/{mode_group_text} dB"
+            )
 
         ax_amp.set_xlabel("Recovered mode index")
 
         ax_amp.set_ylabel("Target mode index")
 
-        norm = mpl.colors.Normalize(vmin=power_floor_dbm, vmax=0.0)
+        cbar = fig.colorbar(im_amp, ax=ax_amp, fraction=0.046, pad=0.04)
 
-        sm = mpl.cm.ScalarMappable(norm=norm, cmap=self._phase_colormap_name)
+        if use_linear_scale:
 
-        sm.set_array([])
+            cbar.set_label("Power (linear relative)")
 
-        cbar = fig.colorbar(sm, ax=ax_amp, fraction=0.046, pad=0.04)
+        else:
 
-        cbar.set_label("Power dBm (relative, clipped at -40 dBm)")
+            cbar.set_label("Power dBm (relative, clipped at -40 dBm)")
 
         fig.tight_layout()
 
@@ -6612,9 +6874,27 @@ class LiveCameraWindow(QMainWindow):
 
         if not self._gaussian_mfd_enabled:
 
+            self._mfd_profile_x_samples = None
+
+            self._mfd_profile_y_samples = None
+
+            self._mfd_profile_x_fit = None
+
+            self._mfd_profile_y_fit = None
+
+            self._mfd_profile_source_name = "n/a"
+
+            self._mfd_profile_x_params = "X fit: n/a"
+
+            self._mfd_profile_y_params = "Y fit: n/a"
+
+            self._mfd_plot_dirty = True
+
             self.gaussian_mfd_label.setText("Gaussian MFD (pixel pitch 15 um): disabled")
 
             return
+
+        self._mfd_plot_dirty = True
 
         self.gaussian_mfd_label.setText("Gaussian MFD (pixel pitch 15 um): waiting for frames...")
 
@@ -6693,6 +6973,18 @@ class LiveCameraWindow(QMainWindow):
 
     def _fit_gaussian_profile_mfd_um(self, profile: np.ndarray) -> Optional[float]:
 
+        fit_details = self._fit_gaussian_profile_details(profile)
+
+        if fit_details is None:
+
+            return None
+
+        return float(fit_details["mfd_um"])
+
+    def _fit_gaussian_profile_details(
+        self, profile: np.ndarray
+    ) -> Optional[dict[str, object]]:
+
         values = np.asarray(profile, dtype=np.float64).ravel()
 
         if values.size < 7:
@@ -6733,7 +7025,7 @@ class LiveCameraWindow(QMainWindow):
 
         try:
 
-            a, _b, _c = np.polyfit(x_fit, y_log, 2)
+            a, b, c = np.polyfit(x_fit, y_log, 2)
 
         except Exception:
 
@@ -6757,51 +7049,83 @@ class LiveCameraWindow(QMainWindow):
 
             return None
 
-        return float(mfd_um)
+        fit_signal = np.exp(a * np.square(x) + b * x + c)
 
-    def _measure_gaussian_mfd(self, image: np.ndarray) -> tuple[Optional[float], Optional[float], Optional[float], str]:
+        fit_values = np.clip(fit_signal, 0.0, None) + float(background)
+
+        center_rel_px = float(-b / (2.0 * a))
+
+        center_abs_px = float(peak_index) + center_rel_px
+
+        y_fit_log = a * np.square(x_fit) + b * x_fit + c
+
+        residual = y_log - y_fit_log
+
+        ss_res = float(np.sum(np.square(residual)))
+
+        ss_tot = float(np.sum(np.square(y_log - float(np.mean(y_log)))))
+
+        r2 = float("nan") if ss_tot <= 1e-12 else float(1.0 - (ss_res / ss_tot))
+
+        return {
+            "mfd_um": float(mfd_um),
+            "waist_px": float(waist_px),
+            "center_px": float(center_abs_px),
+            "peak_px": int(peak_index),
+            "background": float(background),
+            "r2": float(r2),
+            "measured": np.asarray(values, dtype=np.float64),
+            "fit": np.asarray(fit_values, dtype=np.float64),
+        }
+
+    def _measure_gaussian_mfd(
+        self, image: np.ndarray
+    ) -> tuple[
+        Optional[float],
+        Optional[float],
+        Optional[float],
+        str,
+        Optional[dict[str, object]],
+        Optional[dict[str, object]],
+    ]:
 
         if image.ndim != 2:
-
-            return None, None, None, "invalid"
+            return None, None, None, "invalid", None, None
 
         roi = self._live_roi
 
         if roi is not None:
-
             x0, y0, x1, y1 = roi
-
             patch = np.asarray(image[y0:y1, x0:x1], dtype=np.float64)
-
             source_name = "ROI"
 
         else:
 
             patch = np.asarray(image, dtype=np.float64)
-
             source_name = "full frame"
 
         if patch.size == 0 or patch.shape[0] < 7 or patch.shape[1] < 7:
-
-            return None, None, None, source_name
+            return None, None, None, source_name, None, None
 
         peak_y, peak_x = np.unravel_index(np.argmax(patch), patch.shape)
 
         profile_x = patch[peak_y, :]
-
         profile_y = patch[:, peak_x]
 
-        mfd_x_um = self._fit_gaussian_profile_mfd_um(profile_x)
+        fit_x = self._fit_gaussian_profile_details(profile_x)
+        fit_y = self._fit_gaussian_profile_details(profile_y)
 
-        mfd_y_um = self._fit_gaussian_profile_mfd_um(profile_y)
+        mfd_x_um = None if fit_x is None else float(fit_x["mfd_um"])
+        mfd_y_um = None if fit_y is None else float(fit_y["mfd_um"])
 
         if mfd_x_um is None or mfd_y_um is None:
 
-            return mfd_x_um, mfd_y_um, None, source_name
-
+            return mfd_x_um, mfd_y_um, None, source_name, fit_x, fit_y
         mfd_eq_um = math.sqrt(max(0.0, mfd_x_um * mfd_y_um))
 
-        return mfd_x_um, mfd_y_um, mfd_eq_um, source_name
+        return mfd_x_um, mfd_y_um, mfd_eq_um, source_name, fit_x, fit_y
+
+
 
     def _get_phase_average_window_size(self) -> int:
 
@@ -7001,6 +7325,7 @@ class LiveCameraWindow(QMainWindow):
             self._intensity_plot_dirty = False
         self._refresh_channel_matrix_plot(force=force)
         self._refresh_svd_plot(force=force)
+        self._refresh_mfd_plot(force=force)
 
     def _on_phase_calibration_center_window_changed(self, value: int) -> None:
 
@@ -9431,7 +9756,70 @@ class LiveCameraWindow(QMainWindow):
                 )
 
             if self._gaussian_mfd_enabled:
-                mfd_x_um, mfd_y_um, mfd_eq_um, source_name = self._measure_gaussian_mfd(image)
+                mfd_x_um, mfd_y_um, mfd_eq_um, source_name, fit_x, fit_y = self._measure_gaussian_mfd(image)
+
+                self._mfd_profile_source_name = source_name
+
+                self._mfd_profile_x_samples = (
+                    None
+                    if fit_x is None
+                    else np.asarray(fit_x.get("measured"), dtype=np.float64)
+                )
+
+                self._mfd_profile_y_samples = (
+                    None
+                    if fit_y is None
+                    else np.asarray(fit_y.get("measured"), dtype=np.float64)
+                )
+
+                self._mfd_profile_x_fit = (
+                    None
+                    if fit_x is None
+                    else np.asarray(fit_x.get("fit"), dtype=np.float64)
+                )
+
+                self._mfd_profile_y_fit = (
+                    None
+                    if fit_y is None
+                    else np.asarray(fit_y.get("fit"), dtype=np.float64)
+                )
+
+                if fit_x is None:
+
+                    self._mfd_profile_x_params = "X fit: failed"
+
+                else:
+
+                    r2_x = float(fit_x.get("r2", float("nan")))
+
+                    r2_x_text = "n/a" if not np.isfinite(r2_x) else f"{r2_x:.3f}"
+
+                    self._mfd_profile_x_params = (
+                        f"X fit: MFD={float(fit_x['mfd_um']):.1f} um, "
+                        f"w={float(fit_x['waist_px']):.2f} px, "
+                        f"center={float(fit_x['center_px']):.2f} px, "
+                        f"R2={r2_x_text}"
+                    )
+
+                if fit_y is None:
+
+                    self._mfd_profile_y_params = "Y fit: failed"
+
+                else:
+
+                    r2_y = float(fit_y.get("r2", float("nan")))
+
+                    r2_y_text = "n/a" if not np.isfinite(r2_y) else f"{r2_y:.3f}"
+
+                    self._mfd_profile_y_params = (
+                        f"Y fit: MFD={float(fit_y['mfd_um']):.1f} um, "
+                        f"w={float(fit_y['waist_px']):.2f} px, "
+                        f"center={float(fit_y['center_px']):.2f} px, "
+                        f"R2={r2_y_text}"
+                    )
+
+                self._mfd_plot_dirty = True
+
                 if mfd_x_um is None or mfd_y_um is None or mfd_eq_um is None:
                     self.gaussian_mfd_label.setText(
                         f"Gaussian MFD (pixel pitch 15 um, {source_name}): fit failed"
