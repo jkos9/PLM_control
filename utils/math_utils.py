@@ -138,6 +138,7 @@ def measure_xt_db_mode_group(matrix, mode_group_indices, one_based=False):
     mg_xt_mean = torch.mean(torch.stack(mg_xt_values))
     return float(10.0 * torch.log10(torch.clamp(mg_xt_mean, min=1e-12)).item())
 
+
 def measure_in_group_power(matrix, mode_group_indices, one_based=False, normalize=True, return_as_loss=True):
     if matrix is None:
         return None

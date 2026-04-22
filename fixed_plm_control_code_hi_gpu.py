@@ -877,9 +877,16 @@ class LiveCameraWindow(QMainWindow):
         self._zernike_row_widgets: dict[
             tuple[int, int], tuple[QLabel, QDoubleSpinBox, QCheckBox]
         ] = {}
+        self._output_zernike_coeff_spins: dict[tuple[int, int], QDoubleSpinBox] = {}
+        self._output_zernike_optimize_checks: dict[tuple[int, int], QCheckBox] = {}
+        self._output_zernike_row_widgets: dict[
+            tuple[int, int], tuple[QLabel, QDoubleSpinBox, QCheckBox]
+        ] = {}
 
         self.zernike_status_label = QLabel("Active Zernike terms: 0")
+        self.output_zernike_status_label = QLabel("Active output Zernike terms: 0")
         self.zernike_reset_button = QPushButton("Reset all to 0")
+        self.output_zernike_reset_button = QPushButton("Reset output to 0")
         self.zernike_load_button = QPushButton("Load Best Coefficients")
         self.zernike_opt_iterations_spin = QSpinBox()
         self.zernike_opt_iterations_spin.setRange(1, 1000)
@@ -909,7 +916,8 @@ class LiveCameraWindow(QMainWindow):
         self.zernike_opt_metric_source_combo.addItem(
             "Mode-group XT + In-group power", "mode_group_plus_in_group"
         )
-        self.zernike_opt_start_button = QPushButton("Start Optimizer")
+        self.zernike_opt_start_button = QPushButton("Start Input Optimizer")
+        self.zernike_opt_start_output_button = QPushButton("Start Output Optimizer")
         self.zernike_opt_stop_button = QPushButton("Stop Optimizer")
         self.zernike_opt_stop_button.setEnabled(False)
 
@@ -1675,6 +1683,66 @@ class LiveCameraWindow(QMainWindow):
 
         zernike_layout.addWidget(zernike_controls_scroll, 1)
 
+        zernike_layout.addWidget(
+            QLabel("Output-field Zernike correction (centered recovered field)")
+        )
+        zernike_layout.addWidget(self.output_zernike_status_label)
+
+        output_zernike_controls_scroll = QScrollArea()
+        output_zernike_controls_scroll.setWidgetResizable(True)
+        output_zernike_controls_container = QWidget()
+        output_zernike_controls_layout = QGridLayout()
+        output_zernike_controls_layout.setContentsMargins(6, 6, 6, 6)
+        output_zernike_controls_layout.setHorizontalSpacing(10)
+        output_zernike_controls_layout.setVerticalSpacing(6)
+        output_zernike_controls_layout.addWidget(QLabel("Term"), 0, 0)
+        output_zernike_controls_layout.addWidget(QLabel("Coeff"), 0, 1)
+        output_zernike_controls_layout.addWidget(QLabel("Optimize"), 0, 2)
+
+        for row_idx, (n, m) in enumerate(self._zernike_terms, start=1):
+
+            alias = self._zernike_alias(n, m)
+
+            label_text = f"Z({n},{m})" if alias == "" else f"Z({n},{m}) - {alias}"
+
+            label = QLabel(label_text)
+
+            spin = QDoubleSpinBox()
+
+            spin.setDecimals(4)
+
+            spin.setRange(-300.0, 300.0)
+
+            spin.setSingleStep(0.01)
+
+            spin.setValue(0.0)
+
+            spin.setSuffix(" rad")
+
+            spin.valueChanged.connect(self._on_output_zernike_coeff_changed)
+
+            optimize_check = QCheckBox()
+
+            optimize_check.setChecked(True)
+
+            self._output_zernike_coeff_spins[(n, m)] = spin
+
+            self._output_zernike_optimize_checks[(n, m)] = optimize_check
+
+            self._output_zernike_row_widgets[(n, m)] = (label, spin, optimize_check)
+
+            output_zernike_controls_layout.addWidget(label, row_idx, 0)
+
+            output_zernike_controls_layout.addWidget(spin, row_idx, 1)
+
+            output_zernike_controls_layout.addWidget(optimize_check, row_idx, 2)
+
+        output_zernike_controls_container.setLayout(output_zernike_controls_layout)
+
+        output_zernike_controls_scroll.setWidget(output_zernike_controls_container)
+
+        zernike_layout.addWidget(output_zernike_controls_scroll, 1)
+
         zernike_opt_row = QHBoxLayout()
 
         zernike_opt_row.addWidget(QLabel("Iterations:"))
@@ -1709,6 +1777,8 @@ class LiveCameraWindow(QMainWindow):
 
         zernike_opt_row.addWidget(self.zernike_opt_start_button)
 
+        zernike_opt_row.addWidget(self.zernike_opt_start_output_button)
+
         zernike_opt_row.addWidget(self.zernike_opt_stop_button)
 
         zernike_opt_row.addStretch(1)
@@ -1740,6 +1810,8 @@ class LiveCameraWindow(QMainWindow):
         zernike_buttons_row = QHBoxLayout()
 
         zernike_buttons_row.addWidget(self.zernike_reset_button)
+
+        zernike_buttons_row.addWidget(self.output_zernike_reset_button)
 
         zernike_buttons_row.addWidget(self.zernike_load_button)
 
@@ -2414,6 +2486,12 @@ class LiveCameraWindow(QMainWindow):
 
         self._zernike_phase_cache_map: Optional[np.ndarray] = None
 
+        self._output_zernike_phase_cache_shape: Optional[tuple[int, int]] = None
+
+        self._output_zernike_phase_cache_coeffs: Optional[tuple[float, ...]] = None
+
+        self._output_zernike_phase_cache_map: Optional[np.ndarray] = None
+
         self._zernike_optimizer_thread: Optional[threading.Thread] = None
 
         self._zernike_optimizer_stop_event = threading.Event()
@@ -2485,6 +2563,8 @@ class LiveCameraWindow(QMainWindow):
         self._zernike_optimizer_algorithm = "aspgd"
 
         self._zernike_optimizer_xt_source = "diag"
+
+        self._zernike_optimizer_target = "input"
 
         self._completed_pattern_loops = 0
 
@@ -2616,9 +2696,17 @@ class LiveCameraWindow(QMainWindow):
 
         self.zernike_reset_button.clicked.connect(self._reset_zernike_coefficients)
 
+        self.output_zernike_reset_button.clicked.connect(
+            self._reset_output_zernike_coefficients
+        )
+
         self.zernike_load_button.clicked.connect(self._on_load_best_zernike_coefficients)
 
         self.zernike_opt_start_button.clicked.connect(self._start_zernike_optimizer)
+
+        self.zernike_opt_start_output_button.clicked.connect(
+            self._start_output_zernike_optimizer
+        )
 
         self.zernike_opt_stop_button.clicked.connect(self._stop_zernike_optimizer)
 
@@ -3109,6 +3197,26 @@ class LiveCameraWindow(QMainWindow):
 
         self._zernike_phase_cache_map = None
 
+    def _on_output_zernike_coeff_changed(self, _value: float) -> None:
+
+        active_terms = 0
+
+        for spin in self._output_zernike_coeff_spins.values():
+
+            if abs(float(spin.value())) > 1e-9:
+
+                active_terms += 1
+
+        self.output_zernike_status_label.setText(
+            f"Active output Zernike terms: {active_terms} / {len(self._zernike_terms)}"
+        )
+
+        self._output_zernike_phase_cache_shape = None
+
+        self._output_zernike_phase_cache_coeffs = None
+
+        self._output_zernike_phase_cache_map = None
+
     def _zernike_alias(self, n: int, m: int) -> str:
 
         alias_map = {
@@ -3160,6 +3268,21 @@ class LiveCameraWindow(QMainWindow):
 
         return enabled_terms
 
+    def _get_output_optimizer_enabled_zernike_terms(self) -> list[tuple[int, int]]:
+        enabled_terms: list[tuple[int, int]] = []
+
+        for term in self._zernike_terms:
+
+            optimize_check = self._output_zernike_optimize_checks.get(term)
+
+            if optimize_check is None or not bool(optimize_check.isChecked()):
+
+                continue
+
+            enabled_terms.append(term)
+
+        return enabled_terms
+
     def _update_zernike_visibility(self) -> None:
 
         for widgets in self._zernike_row_widgets.values():
@@ -3183,6 +3306,18 @@ class LiveCameraWindow(QMainWindow):
             spin.blockSignals(False)
 
         self._on_zernike_coeff_changed(0.0)
+
+    def _reset_output_zernike_coefficients(self) -> None:
+
+        for spin in self._output_zernike_coeff_spins.values():
+
+            spin.blockSignals(True)
+
+            spin.setValue(0.0)
+
+            spin.blockSignals(False)
+
+        self._on_output_zernike_coeff_changed(0.0)
 
     def _parse_zernike_coefficients_text(
         self, text: str
@@ -3324,6 +3459,18 @@ class LiveCameraWindow(QMainWindow):
 
         return coeffs
 
+    def _capture_output_zernike_coefficients_snapshot(
+        self,
+    ) -> dict[tuple[int, int], float]:
+
+        coeffs: dict[tuple[int, int], float] = {}
+
+        for term, spin in self._output_zernike_coeff_spins.items():
+
+            coeffs[term] = float(spin.value())
+
+        return coeffs
+
     def _on_browse_zernike_opt_results_file(self) -> None:
 
         file_path, _ = QFileDialog.getSaveFileName(
@@ -3413,25 +3560,33 @@ class LiveCameraWindow(QMainWindow):
 
         payload = coeffs
 
+        input_coeffs_applied = False
+
         coeff_values: object = payload.get("zernike_coeffs")
+
+        coeff_dict: Optional[dict] = None
 
         if isinstance(coeff_values, dict):
 
             coeff_dict = coeff_values
 
-        else:
+        elif all(isinstance(k, tuple) and len(k) == 2 for k in payload.keys()):
 
             coeff_dict = payload
 
-        for term, spin in self._zernike_coeff_spins.items():
+        if isinstance(coeff_dict, dict):
 
-            value = float(coeff_dict.get(term, spin.value()))
+            for term, spin in self._zernike_coeff_spins.items():
 
-            spin.blockSignals(True)
+                value = float(coeff_dict.get(term, spin.value()))
 
-            spin.setValue(max(-300.0, min(300.0, value)))
+                spin.blockSignals(True)
 
-            spin.blockSignals(False)
+                spin.setValue(max(-300.0, min(300.0, value)))
+
+                spin.blockSignals(False)
+
+            input_coeffs_applied = True
 
         if "hologram_scale_x_factor" in payload:
 
@@ -3539,11 +3694,29 @@ class LiveCameraWindow(QMainWindow):
 
                 pass
 
-        self._on_hologram_scale_controls_changed()
+        output_coeff_values: object = payload.get("output_zernike_coeffs")
 
-        self._on_hologram_position_controls_changed()
+        if isinstance(output_coeff_values, dict):
 
-        self._on_zernike_coeff_changed(0.0)
+            for term, spin in self._output_zernike_coeff_spins.items():
+
+                value = float(output_coeff_values.get(term, spin.value()))
+
+                spin.blockSignals(True)
+
+                spin.setValue(max(-300.0, min(300.0, value)))
+
+                spin.blockSignals(False)
+
+            self._on_output_zernike_coeff_changed(0.0)
+
+        if input_coeffs_applied:
+
+            self._on_hologram_scale_controls_changed()
+
+            self._on_hologram_position_controls_changed()
+
+            self._on_zernike_coeff_changed(0.0)
 
     def _decode_optimizer_metric_source(self, metric_source: str) -> tuple[str, bool]:
 
@@ -3647,10 +3820,19 @@ class LiveCameraWindow(QMainWindow):
         return None
 
     def _coeff_vector_to_dict(
-        self, enabled_terms: list[tuple[int, int]], coeff_vector: np.ndarray
+        self,
+        enabled_terms: list[tuple[int, int]],
+        coeff_vector: np.ndarray,
+        optimizer_target: str,
     ) -> dict[tuple[int, int], float]:
 
-        coeff_dict = self._capture_zernike_coefficients_snapshot()
+        if str(optimizer_target) == "output":
+
+            coeff_dict = self._capture_output_zernike_coefficients_snapshot()
+
+        else:
+
+            coeff_dict = self._capture_zernike_coefficients_snapshot()
 
         for idx, term in enumerate(enabled_terms):
 
@@ -3662,10 +3844,25 @@ class LiveCameraWindow(QMainWindow):
         self,
         enabled_terms: list[tuple[int, int]],
         coeff_vector: np.ndarray,
+        optimizer_target: str,
     ) -> dict[str, object]:
 
+        if str(optimizer_target) == "output":
+
+            return {
+                "output_zernike_coeffs": self._coeff_vector_to_dict(
+                    enabled_terms,
+                    coeff_vector,
+                    optimizer_target="output",
+                )
+            }
+
         payload: dict[str, object] = {
-            "zernike_coeffs": self._coeff_vector_to_dict(enabled_terms, coeff_vector)
+            "zernike_coeffs": self._coeff_vector_to_dict(
+                enabled_terms,
+                coeff_vector,
+                optimizer_target="input",
+            )
         }
 
         idx = len(enabled_terms)
@@ -3724,11 +3921,16 @@ class LiveCameraWindow(QMainWindow):
         coeff_vector: np.ndarray,
         last_loop: int,
         metric_source: str,
+        optimizer_target: str,
         timeout_s: float = 120.0,
     ) -> Optional[tuple[int, float]]:
 
         self.zernike_coefficients_apply_requested.emit(
-            self._build_optimizer_apply_payload(enabled_terms, coeff_vector)
+            self._build_optimizer_apply_payload(
+                enabled_terms,
+                coeff_vector,
+                optimizer_target=optimizer_target,
+            )
         )
 
         return self._wait_for_next_loop_xt_metric(
@@ -3737,7 +3939,7 @@ class LiveCameraWindow(QMainWindow):
             timeout_s=timeout_s,
         )
 
-    def _start_zernike_optimizer(self) -> None:
+    def _start_zernike_optimizer(self, optimizer_target: str = "input") -> None:
 
         if (
             self._zernike_optimizer_thread is not None
@@ -3754,48 +3956,74 @@ class LiveCameraWindow(QMainWindow):
 
             return
 
-        enabled_terms = self._get_optimizer_enabled_zernike_terms()
+        target = str(optimizer_target or "input")
 
-        optimize_scale_x = bool(self.hologram_scale_optimize_x_checkbox.isChecked())
+        if target not in ("input", "output"):
 
-        optimize_scale_y = bool(self.hologram_scale_optimize_y_checkbox.isChecked())
+            target = "input"
 
-        optimize_shift_x = bool(self.hologram_shift_optimize_x_checkbox.isChecked())
+        self._zernike_optimizer_target = target
 
-        optimize_shift_y = bool(self.hologram_shift_optimize_y_checkbox.isChecked())
+        if target == "output":
 
-        if optimize_scale_x and not bool(self.hologram_scale_x_checkbox.isChecked()):
+            enabled_terms = self._get_output_optimizer_enabled_zernike_terms()
+            optimize_scale_x = False
+            optimize_scale_y = False
+            optimize_shift_x = False
+            optimize_shift_y = False
 
-            self.hologram_scale_x_checkbox.setChecked(True)
+            if len(enabled_terms) <= 0:
 
-        if optimize_scale_y and not bool(self.hologram_scale_y_checkbox.isChecked()):
+                self._set_zernike_optimizer_status(
+                    "Output optimizer: select at least one output Zernike optimize toggle"
+                )
 
-            self.hologram_scale_y_checkbox.setChecked(True)
+                return
 
-        if optimize_shift_x and not bool(self.hologram_shift_x_checkbox.isChecked()):
+        else:
 
-            self.hologram_shift_x_checkbox.setChecked(True)
+            enabled_terms = self._get_optimizer_enabled_zernike_terms()
 
-        if optimize_shift_y and not bool(self.hologram_shift_y_checkbox.isChecked()):
+            optimize_scale_x = bool(self.hologram_scale_optimize_x_checkbox.isChecked())
 
-            self.hologram_shift_y_checkbox.setChecked(True)
+            optimize_scale_y = bool(self.hologram_scale_optimize_y_checkbox.isChecked())
 
-        self._on_hologram_scale_controls_changed()
+            optimize_shift_x = bool(self.hologram_shift_optimize_x_checkbox.isChecked())
 
-        self._on_hologram_position_controls_changed()
+            optimize_shift_y = bool(self.hologram_shift_optimize_y_checkbox.isChecked())
 
-        if len(enabled_terms) <= 0 and not (
-            optimize_scale_x
-            or optimize_scale_y
-            or optimize_shift_x
-            or optimize_shift_y
-        ):
+            if optimize_scale_x and not bool(self.hologram_scale_x_checkbox.isChecked()):
 
-            self._set_zernike_optimizer_status(
-                "Optimizer: select at least one n<=2 Zernike optimize toggle or transform optimize toggle"
-            )
+                self.hologram_scale_x_checkbox.setChecked(True)
 
-            return
+            if optimize_scale_y and not bool(self.hologram_scale_y_checkbox.isChecked()):
+
+                self.hologram_scale_y_checkbox.setChecked(True)
+
+            if optimize_shift_x and not bool(self.hologram_shift_x_checkbox.isChecked()):
+
+                self.hologram_shift_x_checkbox.setChecked(True)
+
+            if optimize_shift_y and not bool(self.hologram_shift_y_checkbox.isChecked()):
+
+                self.hologram_shift_y_checkbox.setChecked(True)
+
+            self._on_hologram_scale_controls_changed()
+
+            self._on_hologram_position_controls_changed()
+
+            if len(enabled_terms) <= 0 and not (
+                optimize_scale_x
+                or optimize_scale_y
+                or optimize_shift_x
+                or optimize_shift_y
+            ):
+
+                self._set_zernike_optimizer_status(
+                    "Input optimizer: select at least one n<=2 input Zernike optimize toggle or transform optimize toggle"
+                )
+
+                return
 
         self._zernike_optimizer_optimize_scale_x = optimize_scale_x
 
@@ -3858,16 +4086,24 @@ class LiveCameraWindow(QMainWindow):
 
         history_path = self.zernike_opt_history_path_edit.text().strip()
 
-        initial_coeffs = self._capture_zernike_coefficients_snapshot()
+        if target == "output":
+
+            initial_coeffs = self._capture_output_zernike_coefficients_snapshot()
+
+        else:
+
+            initial_coeffs = self._capture_zernike_coefficients_snapshot()
 
         self._zernike_optimizer_stop_event.clear()
 
         self.zernike_opt_start_button.setEnabled(False)
 
+        self.zernike_opt_start_output_button.setEnabled(False)
+
         self.zernike_opt_stop_button.setEnabled(True)
 
         self._set_zernike_optimizer_status(
-            f"Optimizer: running ({optimizer_algorithm}, metric={optimizer_metric_source})"
+            f"{target.capitalize()} optimizer: running ({optimizer_algorithm}, metric={optimizer_metric_source})"
         )
 
         self._zernike_optimizer_thread = threading.Thread(
@@ -3881,6 +4117,7 @@ class LiveCameraWindow(QMainWindow):
                 max_degree,
                 optimizer_algorithm,
                 optimizer_metric_source,
+                target,
                 results_path,
                 history_path,
             ),
@@ -3888,6 +4125,10 @@ class LiveCameraWindow(QMainWindow):
         )
 
         self._zernike_optimizer_thread.start()
+
+    def _start_output_zernike_optimizer(self) -> None:
+
+        self._start_zernike_optimizer(optimizer_target="output")
 
     def _stop_zernike_optimizer(self) -> None:
 
@@ -3908,6 +4149,8 @@ class LiveCameraWindow(QMainWindow):
 
         self.zernike_opt_start_button.setEnabled(True)
 
+        self.zernike_opt_start_output_button.setEnabled(True)
+
         self.zernike_opt_stop_button.setEnabled(False)
 
         self._zernike_optimizer_thread = None
@@ -3924,11 +4167,18 @@ class LiveCameraWindow(QMainWindow):
         max_degree: int,
         optimizer_algorithm: str,
         optimizer_metric_source: str,
+        optimizer_target: str,
         results_path: str,
         history_path: str,
     ) -> None:
 
         try:
+
+            optimizer_target = str(optimizer_target or "input")
+
+            if optimizer_target not in ("input", "output"):
+
+                optimizer_target = "input"
 
             optimize_scale_x = bool(
                 getattr(self, "_zernike_optimizer_optimize_scale_x", False)
@@ -3945,6 +4195,16 @@ class LiveCameraWindow(QMainWindow):
             optimize_shift_y = bool(
                 getattr(self, "_zernike_optimizer_optimize_shift_y", False)
             )
+
+            if optimizer_target == "output":
+
+                optimize_scale_x = False
+
+                optimize_scale_y = False
+
+                optimize_shift_x = False
+
+                optimize_shift_y = False
 
             shift_x_min = -10000.0
 
@@ -4240,7 +4500,7 @@ class LiveCameraWindow(QMainWindow):
                 last_loop = int(self._completed_pattern_loops)
 
                 self.zernike_optimizer_status_updated.emit(
-                    f"Optimizer: baseline evaluation ({optimizer_algorithm}, metric={optimizer_metric_source})"
+                    f"{optimizer_target.capitalize()} optimizer: baseline evaluation ({optimizer_algorithm}, metric={optimizer_metric_source})"
                 )
 
                 baseline_metric = self._evaluate_zernike_optimizer_candidate(
@@ -4248,6 +4508,7 @@ class LiveCameraWindow(QMainWindow):
                     theta,
                     last_loop,
                     metric_source=optimizer_metric_source,
+                    optimizer_target=optimizer_target,
                     timeout_s=120.0,
                 )
 
@@ -4305,6 +4566,7 @@ class LiveCameraWindow(QMainWindow):
                             simplex[vertex_idx],
                             last_loop,
                             metric_source=optimizer_metric_source,
+                            optimizer_target=optimizer_target,
                             timeout_s=120.0,
                         )
 
@@ -4374,6 +4636,7 @@ class LiveCameraWindow(QMainWindow):
                             xr,
                             last_loop,
                             metric_source=optimizer_metric_source,
+                            optimizer_target=optimizer_target,
                             timeout_s=120.0,
                         )
 
@@ -4397,6 +4660,7 @@ class LiveCameraWindow(QMainWindow):
                                 xe,
                                 last_loop,
                                 metric_source=optimizer_metric_source,
+                                optimizer_target=optimizer_target,
                                 timeout_s=120.0,
                             )
 
@@ -4448,6 +4712,7 @@ class LiveCameraWindow(QMainWindow):
                                     xc,
                                     last_loop,
                                     metric_source=optimizer_metric_source,
+                                    optimizer_target=optimizer_target,
                                     timeout_s=120.0,
                                 )
 
@@ -4483,6 +4748,7 @@ class LiveCameraWindow(QMainWindow):
                                     xc,
                                     last_loop,
                                     metric_source=optimizer_metric_source,
+                                    optimizer_target=optimizer_target,
                                     timeout_s=120.0,
                                 )
 
@@ -4525,6 +4791,7 @@ class LiveCameraWindow(QMainWindow):
                                         simplex[vertex_idx],
                                         last_loop,
                                         metric_source=optimizer_metric_source,
+                                        optimizer_target=optimizer_target,
                                         timeout_s=120.0,
                                     )
 
@@ -4574,7 +4841,7 @@ class LiveCameraWindow(QMainWindow):
                         )
 
                         self.zernike_optimizer_status_updated.emit(
-                            f"Optimizer(Nelder-Mead, metric={optimizer_metric_source}): iter {it}/{iterations}, loss={current_best_xt_db:.6f} (best {float(best_xt_db):.6f})"
+                            f"{optimizer_target.capitalize()} optimizer (Nelder-Mead, metric={optimizer_metric_source}): iter {it}/{iterations}, loss={current_best_xt_db:.6f} (best {float(best_xt_db):.6f})"
                         )
 
                 elif optimizer_algorithm == "stochastic_hill_climb":
@@ -4602,6 +4869,7 @@ class LiveCameraWindow(QMainWindow):
                             candidate_theta,
                             last_loop,
                             metric_source=optimizer_metric_source,
+                            optimizer_target=optimizer_target,
                             timeout_s=120.0,
                         )
 
@@ -4629,7 +4897,7 @@ class LiveCameraWindow(QMainWindow):
                             phase_label = "accept"
 
                             self.zernike_optimizer_status_updated.emit(
-                                f"Optimizer(Stochastic Hill Climb, metric={optimizer_metric_source}): iter {it}/{iterations}, improved loss={float(best_xt_db):.6f}"
+                                f"{optimizer_target.capitalize()} optimizer (Stochastic Hill Climb, metric={optimizer_metric_source}): iter {it}/{iterations}, improved loss={float(best_xt_db):.6f}"
                             )
 
                         else:
@@ -4639,7 +4907,7 @@ class LiveCameraWindow(QMainWindow):
                             phase_label = "reject"
 
                             self.zernike_optimizer_status_updated.emit(
-                                f"Optimizer(Stochastic Hill Climb, metric={optimizer_metric_source}): iter {it}/{iterations}, loss={float(candidate_xt_db):.6f} (best {float(best_xt_db):.6f})"
+                                f"{optimizer_target.capitalize()} optimizer (Stochastic Hill Climb, metric={optimizer_metric_source}): iter {it}/{iterations}, loss={float(candidate_xt_db):.6f} (best {float(best_xt_db):.6f})"
                             )
 
                         _write_row(
@@ -4694,6 +4962,7 @@ class LiveCameraWindow(QMainWindow):
                             theta_plus,
                             last_loop,
                             metric_source=optimizer_metric_source,
+                            optimizer_target=optimizer_target,
                             timeout_s=120.0,
                         )
 
@@ -4714,6 +4983,7 @@ class LiveCameraWindow(QMainWindow):
                             theta_minus,
                             last_loop,
                             metric_source=optimizer_metric_source,
+                            optimizer_target=optimizer_target,
                             timeout_s=120.0,
                         )
 
@@ -4750,6 +5020,7 @@ class LiveCameraWindow(QMainWindow):
                             theta,
                             last_loop,
                             metric_source=optimizer_metric_source,
+                            optimizer_target=optimizer_target,
                             timeout_s=120.0,
                         )
 
@@ -4787,13 +5058,21 @@ class LiveCameraWindow(QMainWindow):
                         )
 
                         self.zernike_optimizer_status_updated.emit(
-                            f"Optimizer(ASPGD, metric={optimizer_metric_source}): iter {it}/{iterations}, loss={float(current_xt_db):.6f} (best {float(best_xt_db):.6f})"
+                            f"{optimizer_target.capitalize()} optimizer (ASPGD, metric={optimizer_metric_source}): iter {it}/{iterations}, loss={float(current_xt_db):.6f} (best {float(best_xt_db):.6f})"
                         )
 
-            best_coeffs = self._coeff_vector_to_dict(enabled_terms, best_theta)
+            best_coeffs = self._coeff_vector_to_dict(
+                enabled_terms,
+                best_theta,
+                optimizer_target=optimizer_target,
+            )
 
             self.zernike_coefficients_apply_requested.emit(
-                self._build_optimizer_apply_payload(enabled_terms, best_theta)
+                self._build_optimizer_apply_payload(
+                    enabled_terms,
+                    best_theta,
+                    optimizer_target=optimizer_target,
+                )
             )
 
             saved_ok, save_info = self._save_zernike_coefficients_to_text(
@@ -4808,14 +5087,14 @@ class LiveCameraWindow(QMainWindow):
 
                 self.zernike_optimizer_finished.emit(
                     True,
-                    f"Optimizer finished ({optimizer_algorithm}, metric={optimizer_metric_source}): best loss={best_xt_db:.6f} | coeffs saved {save_info} | csv {history_file_path}",
+                    f"{optimizer_target.capitalize()} optimizer finished ({optimizer_algorithm}, metric={optimizer_metric_source}): best loss={best_xt_db:.6f} | coeffs saved {save_info} | csv {history_file_path}",
                 )
 
             else:
 
                 self.zernike_optimizer_finished.emit(
                     True,
-                    f"Optimizer finished ({optimizer_algorithm}, metric={optimizer_metric_source}): best loss={best_xt_db:.6f} | csv {history_file_path} | coeff save failed: {save_info}",
+                    f"{optimizer_target.capitalize()} optimizer finished ({optimizer_algorithm}, metric={optimizer_metric_source}): best loss={best_xt_db:.6f} | csv {history_file_path} | coeff save failed: {save_info}",
                 )
 
         except Exception as exc:
@@ -4976,6 +5255,135 @@ class LiveCameraWindow(QMainWindow):
         self._zernike_phase_cache_map = phase
 
         return phase
+
+    def _build_output_zernike_phase_map(self, shape: tuple[int, int]) -> np.ndarray:
+
+        height, width = int(shape[0]), int(shape[1])
+
+        coeff_values = tuple(
+            round(float(self._output_zernike_coeff_spins[(n, m)].value()), 6)
+            for (n, m) in self._zernike_terms
+        )
+
+        cache_key = (*coeff_values,)
+
+        if (
+            self._output_zernike_phase_cache_map is not None
+            and self._output_zernike_phase_cache_shape == (height, width)
+            and self._output_zernike_phase_cache_coeffs == cache_key
+        ):
+
+            return self._output_zernike_phase_cache_map
+
+        x = np.arange(width, dtype=np.float32) - 0.5 * float(width - 1)
+
+        y = np.arange(height, dtype=np.float32) - 0.5 * float(height - 1)
+
+        yy, xx = np.meshgrid(y, x, indexing="ij")
+
+        aperture_radius = max(
+            1e-12,
+            min(
+                float(np.max(np.abs(x))) if width > 0 else 0.0,
+                float(np.max(np.abs(y))) if height > 0 else 0.0,
+            ),
+        )
+
+        xx_n = xx / float(aperture_radius)
+
+        yy_n = yy / float(aperture_radius)
+
+        r = np.sqrt(xx_n * xx_n + yy_n * yy_n)
+
+        theta = np.arctan2(yy_n, xx_n)
+
+        aperture = r <= 1.0
+
+        phase = np.zeros((height, width), dtype=np.float32)
+
+        for coeff, (n, m) in zip(coeff_values, self._zernike_terms):
+
+            if abs(float(coeff)) <= 1e-9:
+
+                continue
+
+            radial = self._zernike_radial_polynomial(n, abs(m), r)
+
+            if m == 0:
+
+                mode = radial
+
+            elif m > 0:
+
+                mode = radial * np.cos(float(m) * theta)
+
+            else:
+
+                mode = radial * np.sin(float(abs(m)) * theta)
+
+            mode = np.where(aperture, mode, 0.0)
+
+            rms = (
+                float(np.sqrt(np.mean(np.square(mode[aperture]))))
+                if np.any(aperture)
+                else 0.0
+            )
+
+            if rms > 1e-12:
+
+                mode = mode / rms
+
+            phase += float(coeff) * mode.astype(np.float32, copy=False)
+
+        phase = np.where(aperture, phase, 0.0).astype(np.float32, copy=False)
+
+        self._output_zernike_phase_cache_shape = (height, width)
+
+        self._output_zernike_phase_cache_coeffs = cache_key
+
+        self._output_zernike_phase_cache_map = phase
+
+        return phase
+
+    def _apply_output_zernike_correction(
+        self,
+        recovered_field: Optional[np.ndarray],
+    ) -> Optional[np.ndarray]:
+
+        if recovered_field is None:
+
+            return None
+
+        field = np.asarray(recovered_field)
+
+        if field.ndim != 2 or field.shape[0] <= 0 or field.shape[1] <= 0:
+
+            return np.asarray(recovered_field)
+
+        if len(self._output_zernike_coeff_spins) <= 0:
+
+            return np.asarray(recovered_field)
+
+        max_abs_coeff = 0.0
+
+        for spin in self._output_zernike_coeff_spins.values():
+
+            max_abs_coeff = max(max_abs_coeff, abs(float(spin.value())))
+
+        if max_abs_coeff <= 1e-9:
+
+            return np.asarray(recovered_field)
+
+        phase_map = self._build_output_zernike_phase_map((int(field.shape[0]), int(field.shape[1])))
+
+        correction = np.exp(-1j * phase_map.astype(np.float32, copy=False)).astype(
+            np.complex64,
+            copy=False,
+        )
+
+        corrected = np.asarray(recovered_field, dtype=np.complex64) * correction
+
+        return np.asarray(corrected, dtype=np.complex64)
 
     def _build_grating_phase_ramp(
         self,
@@ -10438,6 +10846,23 @@ class LiveCameraWindow(QMainWindow):
         # --- DATA PROCESSING (Always execute to prevent missing data) ---
         
         self._handle_phase_calibration_frame(image, frame_count)
+
+        recovered_field = self._apply_output_zernike_correction(recovered_field)
+
+        if (
+            recovered_field is not None
+            and np.asarray(recovered_field).ndim == 2
+            and int(np.asarray(recovered_field).size) > 0
+        ):
+            amplitude = np.abs(recovered_field)
+            amplitude_norm = amplitude / (float(np.max(amplitude)) + 1e-12)
+            recovered_phase = np.angle(recovered_field)
+            phase_rgb = phase_to_rgb_uint8(
+                recovered_phase,
+                value=amplitude_norm,
+                cmap_name=self._phase_colormap_name,
+            )
+
         self._latest_recovered_field = recovered_field
 
         if roi_sum is not None and roi_mean is not None:
