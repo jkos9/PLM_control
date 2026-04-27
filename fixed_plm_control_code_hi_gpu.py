@@ -15,14 +15,12 @@ import matplotlib as mpl
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from PIL import Image
-#from pygame import image
+
 from vmbpy import PixelFormat, VmbSystem
 from time import time
 
 import os
 from time import perf_counter, time, sleep
-import pygame
-from OpenGL.GL import *
 
 from utils.math_utils import *
 from utils.field_utils import *
@@ -88,8 +86,8 @@ except ImportError as exc:
 
 
 from ti_plm import PLM
+from ti_plm.display import EventLoopExit, ImageWindow_Open_GL
 from ti_plm.display import EventLoopExit, ImageWindow
-
 
 class FrameProcessorThread(QtCore.QThread):
     # Payload: frame_count, image, fft_image, recovered_field, phase_rgb, roi_sum, roi_mean
@@ -2603,7 +2601,9 @@ class LiveCameraWindow(QMainWindow):
         self._plot_refresh_timer = QTimer(self)
 
         self.processor_thread = FrameProcessorThread(self)
+
         self.processor_thread.frame_processed.connect(self._on_frame_processed)
+
         self.processor_thread.error_occurred.connect(self._on_processor_error)
 
         self._plot_refresh_timer.setInterval(100)
@@ -10542,6 +10542,7 @@ class LiveCameraWindow(QMainWindow):
 
             interval_s = max(0.01, interval_ms / 1000.0)
 
+            #with ImageWindow_Open_GL(fullscreen=True, monitor=monitor) as win:
             with ImageWindow(fullscreen=True, monitor=monitor) as win:
 
                 frame_idx = 0
@@ -10693,11 +10694,91 @@ class LiveCameraWindow(QMainWindow):
                         self._apply_hologram_scaling(composed)
                     )
 
-                #def precompute_phase_lut_for_pattern_loop() -> np.ndarray:
+                def precompute_phase_lut_for_pattern_loop() -> tuple[np.ndarray, np.ndarray]:
+                    overlaid_phase_stack = np.empty(
+                        (int(total_frames), int(expected_h), int(expected_w)),
+                        dtype=np.float32,
+                    )
+                    state_indices_stack = np.empty(
+                        (int(total_frames), int(expected_h), int(expected_w)),
+                        dtype=np.int32,
+                    )
+
+                    for frame_offset in range(int(total_frames)):
+                        if self._plm_stop_event.is_set():
+                            raise EventLoopExit
+
+                        display_idx = int(loop_start_0_based + frame_offset)
+                        overlaid_phase = np.asarray(
+                            _compose_overlaid_phase(display_idx), dtype=np.float32
+                        )
+                        state_indices = np.digitize(
+                            overlaid_phase, buckets, right=False
+                        ).astype(np.int32)
+
+                        overlaid_phase_stack[frame_offset] = overlaid_phase
+                        state_indices_stack[frame_offset] = np.clip(
+                            state_indices, 0, n_states - 1
+                        )
+
+                    return overlaid_phase_stack, state_indices_stack
+
+                def precompute_bmp_images_for_pattern_loop(
+                    state_indices_stack: np.ndarray,
+                ) -> list[Image.Image]:
+                    bmp_image_stack: list[Image.Image] = []
+
+                    for frame_offset in range(int(total_frames)):
+                        if self._plm_stop_event.is_set():
+                            raise EventLoopExit
+
+                        phase_for_lut = phase_values[state_indices_stack[frame_offset]]
+                        bmp = plm.process_phase_map(phase_for_lut)
+                        bmp_image_stack.append(Image.fromarray(bmp))
+
+                    return bmp_image_stack
+
+                def _current_overlay_signature() -> tuple[object, ...]:
+                    if dynamic_phase_cal:
+                        return ("phase_cal",)
+
+                    enabled_terms = set(self._get_enabled_zernike_terms())
+                    max_degree = int(self._get_selected_zernike_max_degree())
+                    coeff_values = tuple(
+                        (
+                            round(float(self._zernike_coeff_spins[(n, m)].value()), 6)
+                            if (n, m) in enabled_terms
+                            else 0.0
+                        )
+                        for (n, m) in self._zernike_terms
+                    )
+
+                    return (
+                        int(self._grating_period_x_px),
+                        int(self._grating_period_y_px),
+                        max_degree,
+                        *coeff_values,
+                    )
+
+                precomputed_overlaid_phase, precomputed_state_indices = (
+                    precompute_phase_lut_for_pattern_loop()
+                )
+                precomputed_bmp_images = precompute_bmp_images_for_pattern_loop(
+                    precomputed_state_indices
+                )
+                precomputed_overlay_signature = _current_overlay_signature()
+                recompute_pending = False
+
 
 
                 def loop_callback() -> None:
-                    nonlocal frame_idx, last_update, cached_periods, cached_ramp
+                    nonlocal frame_idx
+                    nonlocal last_update
+                    nonlocal precomputed_overlaid_phase
+                    nonlocal precomputed_state_indices
+                    nonlocal precomputed_bmp_images
+                    nonlocal precomputed_overlay_signature
+                    nonlocal recompute_pending
                     if self._plm_stop_event.is_set():
                         raise EventLoopExit
                     
@@ -10705,40 +10786,40 @@ class LiveCameraWindow(QMainWindow):
 
                     if now - last_update >= interval_s:
 
-                        t1 = time()
-                        display_idx = (
-                            int(loop_start_0_based + hold_idx_0_based)
+                        active_frame_idx = (
+                            int(hold_idx_0_based)
                             if int(hold_idx_0_based) >= 0
-                            else int(loop_start_0_based + frame_idx)
+                            else int(frame_idx)
                         )
-                        overlaid_phase = _compose_overlaid_phase(display_idx)
-                        
-                        #self.plm_phase_preview_updated.emit(
-                        #    np.asarray(overlaid_phase, dtype=np.float32)
-                        #)
 
-                        state_indices = np.digitize(
-                            overlaid_phase, buckets, right=False
-                        ).astype(np.int32)
-                        t2 = time()
-                        print(f"Phase composition and digitization timing: {t2 - t1:.3f}s")
-
+                        if not dynamic_phase_cal:
+                            current_signature = _current_overlay_signature()
+                            if current_signature != precomputed_overlay_signature:
+                                recompute_pending = True
 
                         t1 = time()
-                        #'''
-                        state_indices = np.clip(state_indices, 0, n_states - 1)
-                        phase_for_lut = phase_values[state_indices]
-                        bmp = plm.process_phase_map(phase_for_lut)
-                        #'''
-                        #bmp = np.zeros((2716, 1600), dtype=np.uint8)
-                        bmp_image = Image.fromarray(bmp)
+                        phase_for_lut = phase_values[
+                            precomputed_state_indices[active_frame_idx]
+                        ]
+                        t2 = time()
+                        print(f"Loop timing: LUT indexing {t2 - t1:.3f}s")
+
+                        t1 = time()
+                        self.plm_phase_preview_updated.emit(
+                            np.asarray(phase_for_lut, dtype=np.float32)
+                        )
+                        t2 = time()
+                        print(f"Loop timing: preview update {t2 - t1:.3f}s")
+
+                        t1 = time()
+                        bmp_image = precomputed_bmp_images[active_frame_idx]
                         t2 = time()
 
                         win.clear()
                         win.load(bmp_image)
                         
                         t3 = time()
-                        print(f"Loop timing: compose {t2 - t1:.3f}s, display {t3 - t2:.3f}s")
+                        print(f"Loop timing: image fetch {t2 - t1:.3f}s, display {t3 - t2:.3f}s")
 
                         counter_idx_1_based = (
                             int(hold_idx_1_based)
@@ -10748,30 +10829,43 @@ class LiveCameraWindow(QMainWindow):
 
                         self.plm_counter_updated.emit(counter_idx_1_based, total_frames)
 
+                        completed_cycle = (
+                            int(hold_idx_0_based) < 0
+                            and int(active_frame_idx) == int(total_frames - 1)
+                        )
+                        if completed_cycle and recompute_pending:
+                            t_recompute = time()
+                            precomputed_overlaid_phase, precomputed_state_indices = (
+                                precompute_phase_lut_for_pattern_loop()
+                            )
+                            precomputed_bmp_images = (
+                                precompute_bmp_images_for_pattern_loop(
+                                    precomputed_state_indices
+                                )
+                            )
+                            precomputed_overlay_signature = _current_overlay_signature()
+                            recompute_pending = False
+                            print(
+                                f"Loop timing: precompute refresh {time() - t_recompute:.3f}s"
+                            )
+
                         if int(hold_idx_0_based) < 0:
 
                             frame_idx = (frame_idx + 1) % total_frames
                         last_update = now
 
                 win.loop_callback = loop_callback
-                initial_display_idx = (
-                    int(loop_start_0_based + hold_idx_0_based)
-                    if int(hold_idx_0_based) >= 0
-                    else int(loop_start_0_based)
+                initial_frame_idx = (
+                    int(hold_idx_0_based) if int(hold_idx_0_based) >= 0 else 0
                 )
-                initial_phase_overlaid = _compose_overlaid_phase(initial_display_idx)
+                initial_phase_overlaid = np.asarray(
+                    precomputed_overlaid_phase[initial_frame_idx], dtype=np.float32
+                )
                 self.plm_phase_preview_updated.emit(
                     np.asarray(initial_phase_overlaid, dtype=np.float32)
                 )
 
-                initial_state_indices = np.digitize(
-                    initial_phase_overlaid, buckets, right=False
-                ).astype(np.int32)
-
-                initial_state_indices = np.clip(initial_state_indices, 0, n_states - 1)
-                initial_phase = phase_values[initial_state_indices]
-
-                win.load(Image.fromarray(plm.process_phase_map(initial_phase)))
+                win.load(precomputed_bmp_images[initial_frame_idx])
                 initial_counter_idx_1_based = (
                     int(hold_idx_1_based) if int(hold_idx_0_based) >= 0 else 1
                 )
@@ -10859,7 +10953,8 @@ class LiveCameraWindow(QMainWindow):
         
         self._handle_phase_calibration_frame(image, frame_count)
 
-        recovered_field = self._apply_output_zernike_correction(recovered_field)
+        # skip this for now since it adds processing time and we want to keep the UI as responsive as possible, especially during live adjustments. The correction can be applied on-demand to the latest recovered field when the user enables it, or we can consider applying it in a separate thread if performance becomes an issue.
+        #recovered_field = self._apply_output_zernike_correction(recovered_field)
 
         if (
             recovered_field is not None
@@ -11051,172 +11146,6 @@ class LiveCameraWindow(QMainWindow):
                 pass
             self._streaming = False
         super().closeEvent(event)
-
-
-    def _current_cache_key(
-        self,
-        plm,
-        loop_start: int,
-        loop_stop: int,
-        ) -> PLMPatternCache:
-        """Build a coefficient snapshot for cache invalidation checks."""
-        correction = self._get_active_phase_correction_map(plm.shape)
-        correction_hash = (
-            int(hash(correction.tobytes())) if correction is not None else None
-        )
-        return PLMPatternCache(
-            images=[],  # empty — just used as a key
-            grating_period_x=int(self._grating_period_x_px),
-            grating_period_y=int(self._grating_period_y_px),
-            zernike_coeffs=(
-                np.array(self._zernike_coeffs) 
-                if self._zernike_coeffs is not None else None
-            ),
-            focal_length_m=float(self._focal_lens_f_m),
-            wavelength_m=float(self._focal_lens_wavelength_m),
-            pitch_x_m=float(self._plm_pixel_pitch_x_m),
-            pitch_y_m=float(self._plm_pixel_pitch_y_m),
-            phase_correction_hash=correction_hash,
-            pattern_array_id=id(self._plm_phase_patterns),
-            loop_start=loop_start,
-            loop_stop=loop_stop,
-        )
-    
-    def _build_plm_pattern_cache(
-        self,
-        plm,
-        phase_values: np.ndarray,
-        buckets: np.ndarray,
-        n_states: int,
-        loop_start_0_based: int,
-        total_frames: int,
-        progress_callback=None,  # optional: fn(current, total) for a progress bar
-    ) -> PLMPatternCache:
-        """
-        Pre-compute all PLM bitmaps for the loop range.
-        Call this once before win.run(). Loop callback then just indexes into images[].
-        """
-        expected_h, expected_w = int(plm.shape[0]), int(plm.shape[1])
-        images = []
-
-        # Build grating ramp once — it doesn't change per frame
-        grating_ramp = self._build_grating_phase_ramp(
-            (expected_h, expected_w),
-            int(self._grating_period_x_px),
-            int(self._grating_period_y_px),
-        )
-
-        # Build Zernike and lens maps once — same for all frames
-        zernike_phase = self._build_zernike_phase_map((expected_h, expected_w))
-
-        focal_length_m = float(self._focal_lens_f_m)
-        if abs(focal_length_m) > 1e-15:
-            focal_lens_phase = self._build_focal_lens_phase_map(
-                (expected_h, expected_w),
-                focal_length_m=focal_length_m,
-                pitch_x_m=float(self._plm_pixel_pitch_x_m),
-                pitch_y_m=float(self._plm_pixel_pitch_y_m),
-                wavelength_m=float(self._focal_lens_wavelength_m),
-            )
-        else:
-            focal_lens_phase = np.zeros((expected_h, expected_w), dtype=np.float32)
-
-        phase_correction = self._get_active_phase_correction_map(
-            (expected_h, expected_w)
-        )
-
-        static_overlay = np.mod(
-            grating_ramp + focal_lens_phase + zernike_phase
-            + (phase_correction if phase_correction is not None
-            else np.zeros((expected_h, expected_w), dtype=np.float32)),
-            2.0 * np.pi,
-        ).astype(np.float32)
-
-        for i in range(total_frames):
-            display_idx = loop_start_0_based + i
-            base_phase = np.mod(
-                self._plm_phase_patterns[display_idx], 2.0 * np.pi
-            )
-
-            composed = np.mod(
-                base_phase + static_overlay, 2.0 * np.pi
-            ).astype(np.float32)
-            composed = self._apply_hologram_position(
-                self._apply_hologram_scaling(composed)
-            )
-
-            state_indices = np.digitize(composed, buckets, right=False)
-            state_indices = np.clip(state_indices, 0, n_states - 1).astype(np.int32)
-            bmp = plm.process_phase_map(phase_values[state_indices])
-            images.append(Image.fromarray(bmp))
-
-            if progress_callback:
-                progress_callback(i + 1, total_frames)
-
-        return PLMPatternCache(
-            images=images,
-            grating_period_x=int(self._grating_period_x_px),
-            grating_period_y=int(self._grating_period_y_px),
-            zernike_coeffs=(
-                np.array(self._zernike_coeffs)
-                if self._zernike_coeffs is not None else None
-            ),
-            focal_length_m=focal_length_m,
-            wavelength_m=float(self._focal_lens_wavelength_m),
-            pitch_x_m=float(self._plm_pixel_pitch_x_m),
-            pitch_y_m=float(self._plm_pixel_pitch_y_m),
-            phase_correction_hash=(
-                int(hash(phase_correction.tobytes()))
-                if phase_correction is not None else None
-            ),
-            pattern_array_id=id(self._plm_phase_patterns),
-            loop_start=loop_start_0_based,
-            loop_stop=loop_start_0_based + total_frames - 1,
-        )
-
-
-
-@dataclass
-class PLMPatternCache:
-    """Pre-computed PLM bitmap cache. Invalidated when any coefficient changes."""
-    
-    # The pre-cooked images, ready to hand to win.load()
-    images: list[Image.Image] = field(default_factory=list)
-    
-    # Snapshot of coefficients at compute time — used for invalidation
-    grating_period_x: int = 0
-    grating_period_y: int = 0
-    zernike_coeffs: Optional[np.ndarray] = None
-    focal_length_m: float = 0.0
-    wavelength_m: float = 0.0
-    pitch_x_m: float = 0.0
-    pitch_y_m: float = 0.0
-    phase_correction_hash: Optional[int] = None
-    pattern_array_id: int = 0  # id() of the source array
-    loop_start: int = 0
-    loop_stop: int = 0
-
-    def is_valid(self, current: "PLMPatternCache") -> bool:
-        """Check if cached images are still valid against current coefficients."""
-        return (
-            self.images
-            and self.grating_period_x   == current.grating_period_x
-            and self.grating_period_y   == current.grating_period_y
-            and self.focal_length_m     == current.focal_length_m
-            and self.wavelength_m       == current.wavelength_m
-            and self.pitch_x_m          == current.pitch_x_m
-            and self.pitch_y_m          == current.pitch_y_m
-            and self.phase_correction_hash == current.phase_correction_hash
-            and self.pattern_array_id   == current.pattern_array_id
-            and self.loop_start         == current.loop_start
-            and self.loop_stop          == current.loop_stop
-            and np.array_equal(self.zernike_coeffs, current.zernike_coeffs)
-        )
-    
-    @property
-    def n_frames(self) -> int:
-        return len(self.images)
-
 
 
 def main() -> int:
