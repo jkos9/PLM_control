@@ -1,0 +1,2 @@
+PS C:\Users\ucapajk> ssh -i $env:USERPROFILE\.ssh\id_ed25519 filipe@cjays "echo print('Hello from cjays') | python"
+Hello from cjays

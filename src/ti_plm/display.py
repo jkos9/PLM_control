@@ -346,7 +346,7 @@ class ImageWindow_Open_GL(Window):
 
         try:
             pg.display.gl_set_attribute(pg.GL_DOUBLEBUFFER, 1)
-            pg.display.gl_set_attribute(pg.GL_SWAP_CONTROL, 0)
+            
         except Exception:
             pass
 

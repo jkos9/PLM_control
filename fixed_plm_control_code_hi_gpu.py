@@ -8991,6 +8991,7 @@ class LiveCameraWindow(QMainWindow):
 
         return row_start, row_end, col_start, col_end, x0, x1, y0, y1
 
+
     def _build_phase_calibration_visibility_pattern(
         self, shape: tuple[int, int]
     ) -> np.ndarray:
@@ -9038,6 +9039,7 @@ class LiveCameraWindow(QMainWindow):
         pattern[y0:y1, x1 - border_w : x1] = section_ramp[:, section_w - border_w :]
 
         return pattern
+
 
     def _restore_patterns_after_phase_calibration_visibility(self) -> None:
 
@@ -10768,8 +10770,40 @@ class LiveCameraWindow(QMainWindow):
                 )
                 precomputed_overlay_signature = _current_overlay_signature()
                 recompute_pending = False
+                precompute_ready = False
 
+                def _ensure_precompute_ready() -> None:
+                    nonlocal precomputed_overlaid_phase
+                    nonlocal precomputed_state_indices
+                    nonlocal precomputed_bmp_images
+                    nonlocal precomputed_overlay_signature
+                    nonlocal recompute_pending
+                    nonlocal precompute_ready
 
+                    if self._plm_stop_event.is_set():
+                        raise EventLoopExit
+
+                    if (
+                        precomputed_state_indices is None
+                        or int(precomputed_state_indices.shape[0]) != int(total_frames)
+                    ):
+                        precomputed_overlaid_phase, precomputed_state_indices = (
+                            precompute_phase_lut_for_pattern_loop()
+                        )
+                        precomputed_overlay_signature = _current_overlay_signature()
+                        recompute_pending = False
+
+                    if int(len(precomputed_bmp_images)) != int(total_frames):
+                        precomputed_bmp_images = precompute_bmp_images_for_pattern_loop(
+                            precomputed_state_indices
+                        )
+
+                    if int(len(precomputed_bmp_images)) == 0:
+                        raise RuntimeError(
+                            "PLM pattern precompute produced no frames."
+                        )
+
+                    precompute_ready = True
 
                 def loop_callback() -> None:
                     nonlocal frame_idx
@@ -10779,8 +10813,12 @@ class LiveCameraWindow(QMainWindow):
                     nonlocal precomputed_bmp_images
                     nonlocal precomputed_overlay_signature
                     nonlocal recompute_pending
+                    nonlocal precompute_ready
                     if self._plm_stop_event.is_set():
                         raise EventLoopExit
+
+                    if not precompute_ready:
+                        return
                     
                     now = perf_counter()
 
@@ -10855,6 +10893,7 @@ class LiveCameraWindow(QMainWindow):
                         last_update = now
 
                 win.loop_callback = loop_callback
+                _ensure_precompute_ready()
                 initial_frame_idx = (
                     int(hold_idx_0_based) if int(hold_idx_0_based) >= 0 else 0
                 )
@@ -10866,6 +10905,7 @@ class LiveCameraWindow(QMainWindow):
                 )
 
                 win.load(precomputed_bmp_images[initial_frame_idx])
+                last_update = perf_counter()
                 initial_counter_idx_1_based = (
                     int(hold_idx_1_based) if int(hold_idx_0_based) >= 0 else 1
                 )
